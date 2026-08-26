@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: build and verify correctness
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Show runner
+        run: |
+          echo "cores: $(nproc)"
+          free -h | head -2
+          java -version
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - name: Generate corpus
+        run: |
+          java -jar build/linkmesh.jar gen --out build/synthetic \
+            --pages 20000 --partitions 16 --links 8 --pagesPerFile 20 --skew 1.0
+
+      - name: Cluster comes up, loads data, runs a job
+        run: |
+          NODES=3 ./scripts/cluster-up.sh
+          java -jar build/linkmesh.jar ingest --controller 127.0.0.1:9000 --prepared build/synthetic
+          java -jar build/linkmesh.jar status --controller 127.0.0.1:9000
+          java -jar build/linkmesh.jar submit --controller 127.0.0.1:9000 --job ci
+          grep METRIC logs/controller.log
+          cp output/backlinks.tsv output/ci-3node.tsv
+          ./scripts/cluster-down.sh
+
+      - name: Same result on one node
+        run: |
+          NODES=1 REPLICATION=1 REDUCERS=1 ./scripts/cluster-up.sh
+          java -jar build/linkmesh.jar ingest --controller 127.0.0.1:9000 --prepared build/synthetic
+          java -jar build/linkmesh.jar submit --controller 127.0.0.1:9000 --job ci-single
+          cp output/backlinks.tsv output/ci-1node.tsv
+          ./scripts/cluster-down.sh
+          ./scripts/verify.sh output/ci-1node.tsv output/ci-3node.tsv
+
+      - name: Wikipedia and WARC ingestion
+        run: |
+          python3 tests/make_test_warc.py build/test.warc.gz
+          NODES=2 ./scripts/cluster-up.sh
+          java -jar build/linkmesh.jar ingest --controller 127.0.0.1:9000 --warc build/test.warc.gz --partitions 4
+          java -jar build/linkmesh.jar submit --controller 127.0.0.1:9000 --job warc
+          ./scripts/cluster-down.sh
+          python3 tests/check_warc_result.py output/backlinks.tsv
+
+      - name: Node failure mid-job
+        run: ./scripts/failure-demo.sh
+
+      - name: Straggler speculation
+        run: ./scripts/straggler-demo.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/
+          retention-days: 7
