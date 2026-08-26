@@ -2,126 +2,275 @@
 
 [![CI](https://github.com/Neuro1729/LinkMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/Neuro1729/LinkMesh/actions/workflows/ci.yml)
 
-A distributed MapReduce engine in Java 21 that builds backlink indexes: for every
-URL, the set of pages linking to it.
+A distributed MapReduce engine in Java 21 that builds **backlink indexes**.
 
-No Spring, no Kafka, no Hadoop, no Maven or Gradle, and no third-party
-dependencies at all. The cluster ships as one 180 KB jar.
+No Spring, no Kafka, no Hadoop, no Maven or Gradle, no third-party dependencies
+at all. The whole cluster ships as one 180 KB jar.
+
+## The problem it solves
+
+You have a pile of web pages. Each page links *out* to other pages. You want the
+opposite: for any page, who links *in* to it.
+
+Say you have four pages:
+
+```
+A links to B, C
+B links to C
+D links to C
+```
+
+Turn that around and you get the backlink index:
+
+```
+B  <-  A
+C  <-  A, B, D
+```
+
+Easy for four pages. The problem is that the input is grouped by *source* and the
+answer is grouped by *target*, so once you have millions of pages you cannot hold
+the whole thing on one machine and flip it. Doing that regrouping across many
+machines is what this project is.
+
+A real answer from a real run over 164,601 Wikipedia articles:
+
+```
+174 pages link to "Albert Einstein":
+  1921, 1934, Aage_Niels_Bohr, Aarau, Age_of_the_universe,
+  Albert_Abraham_Michelson, Albert_Einstein_Square, Alcubierre_drive, ...
+```
+
+## Quick start
 
 ```bash
 ./scripts/build.sh
 ./scripts/demo.sh
 ```
 
-## What it does
+That builds the jar, generates a corpus, starts a 3-machine cluster on your
+laptop, distributes the data, runs a job, and shows where everything landed.
 
-- Shards a corpus into partitions and distributes them across machines
-- Keeps every partition on N machines (default 2) and re-replicates when one dies
-- Schedules map tasks onto machines that already hold the data
-- Starts a backup attempt when a task runs long, takes whichever finishes first
-- Reads Wikipedia dumps and Common Crawl WARC files
-- Adding a machine takes one flag
+---
+
+## Terms
+
+Worth reading once. The rest of the README uses these words precisely.
+
+### The data
+
+**Page** — one web page: a URL, plus the links going out of it.
+
+**Edge** — one link, written `(source, target)`. Page A linking to page B is the
+edge `(A, B)`.
+
+**Key** — a target URL in the finished index. Each key has a set of sources
+pointing at it.
+
+**Fan-in** — how many pages link to one key. `United_States` had a fan-in of
+19,242 in the Wikipedia run. This number matters more than it looks; see
+[Why one reducer always finishes last](#why-one-reducer-always-finishes-last).
+
+**Partition** — the corpus split into chunks, sharded by hashing the source URL.
+64 partitions means the corpus is in 64 pieces. A partition is both the unit that
+moves between machines and the unit of work handed out.
+
+### The processing
+
+**Map stage** — read pages, emit one edge per link. Fully parallel: every
+partition can be processed independently, on any machine.
+
+**Shuffle** — send each edge to the machine responsible for its target. This is
+the regrouping step, and it is the whole point of MapReduce. Destination is
+`hash(targetUrl) % reducerCount`, so every edge pointing at the same target lands
+on the same machine.
+
+**Reduce stage** — collect what arrived and group it. Here that means building
+`Map<target, Set<source>>`.
+
+Note that the map stage shards by **source** and the shuffle shards by
+**target**. Moving each edge from one grouping to the other is the actual work.
+
+### The machines
+
+**Controller** — one process that tracks which machines are alive, decides where
+data lives, hands out work, and writes the final output. Holds no data itself.
+
+**Node** (also: worker) — a process that stores data, runs map tasks, and
+possibly acts as a reducer. Every node does all three. There is no separate
+"mapper machine" and "reducer machine."
+
+**Reducer** — a node additionally assigned to hold part of the index for a job.
+It keeps its slice in memory and receives shuffle traffic from every mapper, so
+it is the role that costs RAM.
+
+**Replication factor (RF)** — how many machines hold a copy of each partition.
+RF=2 means every partition is on two machines, so one can die without data loss.
+
+**Locality** — running a task on a machine that already holds the data, so
+nothing has to be copied first.
+
+### The knobs
+
+**`--slots`** — how many map tasks one node runs at the same time. **The most
+important setting**, for reasons in
+[Why slots matter and threads do not](#why-slots-matter-and-threads-do-not).
+Defaults to cores/2.
+
+**`--parserThreads`** — how many threads work inside a single map task. Defaults
+to 2. Raising it does far less than you would expect.
+
+**`--reducers`** — how many nodes hold the index for a job. More reducers means
+less memory each and more parallelism in the reduce stage.
+
+**`--replication`** — the RF above. Default 2.
+
+### Fault handling
+
+**Straggler** — a task taking much longer than the others, usually because its
+machine is slow rather than because its work is bigger.
+
+**Speculative execution** — spotting a straggler, starting a second copy of the
+task elsewhere, and taking whichever finishes first.
+
+**Gossip** — nodes periodically telling each other who they can still reach, so a
+machine that has frozen gets noticed even when its socket is still open.
+
+---
 
 ## Cluster setup
 
-Controller (one machine):
+One machine runs the controller:
 
 ```bash
 java -jar linkmesh.jar controller --port 9000 --replication 2 --reducers 2
 ```
 
-Every other machine:
+Every other machine joins with one flag:
 
 ```bash
 java -jar linkmesh.jar worker --controller 192.168.1.10:9000
 ```
 
-Node id, LAN address, listen port and data directory are all derived. A node
-reports whatever it already has on disk when it joins, so restarts are cheap.
+Node name, network address, port and data directory are all worked out for you. A
+node reports what it already has on disk when it joins, so restarting one is
+cheap.
 
-Reducers hold their slice of the index in memory and absorb shuffle traffic from
-every mapper, so put them on the machines with RAM:
+Reducers hold their slice of the index in memory, so put them where the RAM is:
 
 ```bash
 java -Xmx8g -jar linkmesh.jar worker --controller HOST:9000 --role reducer
 java -jar linkmesh.jar worker --controller HOST:9000 --role mapper
 ```
 
-Full setup guide including firewall rules: [docs/OPERATING.md](docs/OPERATING.md).
+Firewall rules and the full setup guide: [docs/OPERATING.md](docs/OPERATING.md).
 
-## Results on real data
+## Loading data
 
-Measured on one laptop: 8 cores, 5.7 GB RAM, Windows 11, OpenJDK 21. Everything
-below is specific to that machine.
+LinkMesh does not crawl. It indexes pages you give it, in one of three formats.
 
-### Dataset
+**Wikipedia dumps:**
 
-Simple English Wikipedia, from the [Wikimedia Enterprise HTML
-dump](https://dumps.wikimedia.org/other/enterprise_html/) (2025-03-20). Real
-article HTML, real link structure.
-
-| | |
-|---|---|
-| Articles indexed | 164,601 |
-| Links extracted | 7,049,474 |
-| Corpus on disk | 389 MB across 64 partitions |
-| Extraction | 3 m 31 s from a 1.1 GB compressed dump |
-| Load onto cluster | 30 s (774 MB including replicas) |
-
-Wikipedia links are same-site, so this run keeps internal links. The default for
-WARC input is the opposite, since on the open web most links are site navigation.
-
-### Full corpus
-
-```
-METRIC map_stage_ms=10228
-METRIC total_job_ms=16816
-METRIC pages=164601
-METRIC links_emitted=7049474
-METRIC backlink_keys=273052
-METRIC max_fan_in=19242
+```bash
+java -jar linkmesh.jar ingest --controller HOST:9000 \
+  --wikipedia simplewiki-NS0-ENTERPRISE-HTML.json.tar.gz --partitions 64
 ```
 
-16.8 s end to end on a single node with `--slots 4`. That is about 16,000
-pages/sec and 690,000 links/sec through the map stage. Output is 358 MB of TSV.
+**WARC files** (Common Crawl, or your own `wget --warc-file` crawl):
 
-Most-referenced articles:
-
-```
-19242  United_States
-17400  Daylight_saving_time
-16278  Wayback_Machine
-15270  Time_zone
-13728  France
+```bash
+java -jar linkmesh.jar ingest --controller HOST:9000 --warc segment.warc.gz --partitions 64
 ```
 
-Backlinks to one article:
+**Plain edge lists** (SNAP and other graph benchmarks):
 
-```
-174 pages reference Albert_Einstein:
-  1921, 1934, Aage_Niels_Bohr, Aarau, Age_of_the_universe,
-  Albert_Abraham_Michelson, Albert_Einstein_Square, Alcubierre_drive, ...
+```bash
+java -jar linkmesh.jar ingest --controller HOST:9000 --edges web-BerkStan.txt.gz --partitions 32
 ```
 
-Fan-in follows the power law you would expect:
+Then run a job:
 
-| backlinks | keys |
-|---|---|
-| 1 | 91,504 |
-| 2-10 | 104,600 |
-| 11-100 | 62,982 |
-| 101-1,000 | 13,783 |
-| 1,000+ | 183 |
+```bash
+java -jar linkmesh.jar submit --controller HOST:9000
+java -jar linkmesh.jar status --controller HOST:9000
+```
 
-That last row is why reduce is the slow stage. Hash partitioning spreads keys
-evenly but not key sizes, so whichever reducer owns `United_States` finishes
-last.
+### Why WARC and not a folder of .html files
 
-### What actually makes it faster
+A saved `page.html` has lost the address it came from. Real HTML is full of
+relative links like `href="/about"`, and you cannot turn that into a real URL
+without knowing which page it was on. WARC records carry a `WARC-Target-URI`
+header with exactly that.
 
-61,322 articles / 2,599,585 links, median of 3 runs, 2 parser threads per task.
+Feeding in bare HTML files would still *run*. It would just produce a wrong index
+without complaining, which is worse than failing.
 
-One node, varying `--slots` (concurrent map tasks):
+### Why URLs get normalized
+
+These four links all point at the same page:
+
+```
+https://beta.example/home
+https://beta.example/home#section
+HTTPS://BETA.EXAMPLE/home
+https://beta.example:443/home
+```
+
+Left alone they become four separate keys and every count is wrong. The ingester
+lowercases the host, drops the fragment, drops the default port, resolves
+relative links against the page URL (honouring `<base href>`), and decodes HTML
+entities. CI asserts an exact expected index from a test file covering all of
+these cases.
+
+### Why same-site links are dropped by default
+
+On the open web, most links on a page are the site's own navigation: header,
+footer, privacy policy. Index those and the top of your results is
+`somesite.com/privacy`. The default keeps only links that cross between sites.
+
+Wikipedia is the exception, since article-to-article links are all same-site, so
+the `--wikipedia` path keeps internal links automatically.
+
+---
+
+## Results, and why they came out that way
+
+Two machines were used, and numbers are labelled with which:
+
+- **Laptop**: 8 cores, 5.7 GB RAM, Windows 11, OpenJDK 21
+- **CI runner**: GitHub Actions, 4 cores AMD EPYC 7763, 15 GB RAM
+
+Every configuration below produced byte-identical output, checked by SHA-256 over
+the sorted index. That is the part that matters most. Timings are secondary.
+
+### The datasets
+
+| dataset | pages / nodes | edges | source |
+|---|---|---|---|
+| Simple English Wikipedia | 164,601 | 7,049,474 | Wikimedia Enterprise HTML dump |
+| web-BerkStan | 685,230 | 7,600,595 | [SNAP](https://snap.stanford.edu/data/) |
+| soc-LiveJournal1 | 4,847,571 | 68,993,773 | [SNAP](https://snap.stanford.edu/data/) |
+
+The SNAP graphs publish their exact edge counts, which doubles as a correctness
+check: extraction produced exactly 7,600,595 and exactly 68,993,773.
+
+### Headline run
+
+164,601 Wikipedia articles, laptop, one node with `--slots 4`:
+
+```
+map stage      10.2 s
+total job      16.8 s
+pages          164,601
+links          7,049,474
+backlink keys  273,052
+max fan-in     19,242
+```
+
+About 16,000 pages/sec through the map stage. Output is 358 MB of TSV.
+
+### Why slots matter and threads do not
+
+Same corpus, one node, changing only `--slots` (laptop, 61,322 articles):
 
 | slots | map stage | speedup |
 |---|---|---|
@@ -130,117 +279,144 @@ One node, varying `--slots` (concurrent map tasks):
 | 4 | 3,618 ms | 3.42x |
 | 8 | 3,621 ms | 3.42x |
 
-Near-linear to 4 slots, then flat: 4 slots x 2 parser threads is 8 threads on 8
-cores. Widening the parser pool instead barely moves anything (1 node, 8 parser
-threads, 1 slot was 12,376 ms, essentially the same as 2 threads). Throughput
-tracks how many partitions are in flight, not how many threads each one gets,
-because every task builds and tears down its own thread pools and one partition
-rarely has enough files to keep a wide pool busy.
+Now the same machine with **slots stuck at 1** but the parser pool widened from 2
+threads to 8: 12,376 ms. Essentially unchanged, despite four times the threads.
 
-`--slots` now defaults to cores/2 for that reason.
+**Why.** A map task is not only parsing. Each one:
 
-### What distribution costs
+1. creates a ForkJoinPool and a parser thread pool
+2. scans its partition directory
+3. parses the files it found
+4. flushes its remaining shuffle batches
+5. shuts both pools down
 
-Same total work in flight (4 concurrent tasks), split across more node processes
-on the same machine:
+Steps 1, 2, 4 and 5 are serial per task, and no number of parser threads shortens
+them. Step 3 is smaller than you would think: a partition here holds about 11
+files, so with 8 parser threads most threads get one file and then go idle.
 
-| layout | map stage | vs one node |
+With `slots=1` the node runs that whole sequence once per partition, 24 times
+back to back, paying the serial part 24 times with nothing overlapping it. With
+`slots=4`, four sequences run at once, so one task's pool setup overlaps another
+task's parsing.
+
+**The unit of useful parallelism here is the task, not the thread.** It flattens
+at 4 because 4 slots x 2 parser threads is 8 threads on 8 cores.
+
+This is also a real inefficiency, not just a tuning fact. Building thread pools
+per task is wasteful, and reusing them across tasks on a node would shrink the
+gap. Not done yet.
+
+### Why splitting one machine into more nodes is slower
+
+Same total work in flight (4 concurrent tasks), just divided across more node
+processes on **one** machine:
+
+| layout | laptop | CI runner |
 |---|---|---|
-| 1 node x 4 slots | 3,324 ms | 1.00x |
-| 2 nodes x 2 slots | 4,288 ms | 0.78x |
-| 4 nodes x 1 slot | 5,004 ms | 0.66x |
+| 1 node x 4 slots | 3,324 ms (1.00x) | 5,021 ms (1.00x) |
+| 2 nodes x 2 slots | 4,288 ms (0.78x) | 5,716 ms (0.88x) |
+| 4 nodes x 1 slot | 5,004 ms (0.66x) | 6,015 ms (0.83x) |
 
-Splitting one machine into more node processes makes it **slower**, by a third at
-4 nodes. Same story on the full corpus: 1 node x 4 slots ran it in 10.2 s of map
-stage, 4 nodes x 1 slot took 15.3 s.
+Splitting one machine into four node processes made it **34% slower** on the
+laptop and 17% slower on the CI runner. Both agree on the direction.
 
-This is the honest result and it is worth stating plainly. Distributing does not
-create CPU. On one box the extra JVMs compete for the same cores and pay
-cross-process shuffle instead of in-process handoff. What distribution buys is
-fault tolerance and the ability to use machines you would otherwise not have. To
-measure a real speedup from adding nodes you need nodes with their own cores,
-which is not something a single laptop can show.
+**Why.** Four JVMs on one box do not create four machines' worth of CPU. What
+they do add is cost:
 
-Every configuration above produced byte-identical output (same SHA-256 over
-193,326 keys).
+- Four separate heaps, four sets of GC threads, four JIT compilers warming up
+- Shuffle that was an in-process method call becomes a TCP round-trip with
+  serialization at both ends, even over loopback
+- Four heartbeat streams, a gossip mesh, four sets of scheduler bookkeeping
+- Four working sets competing for the same CPU cache
 
-CI re-checks the correctness claims on every push, on a clean 2-core GitHub
-runner: a 3-node run and a 1-node run must produce the same index, a node killed
-mid-job must not change the result, speculation must not change the result, and
-a hand-built WARC must normalize to an exact expected index.
+The laptop takes the bigger hit because it has less RAM and slower cores, so the
+fixed per-JVM overhead is a larger share of what it has.
 
-Reproduce:
+**What this means in practice.** Distribution is not a speed feature. It buys
+fault tolerance and the ability to use machines you would otherwise not have. If
+you have one machine, run one node and raise `--slots`. Showing that adding
+*machines* speeds things up needs machines with their own cores, which a single
+host cannot demonstrate however it is configured.
 
-```bash
-java -jar build/linkmesh.jar ingest --wikipedia DUMP.tar.gz --out build/wiki-corpus --partitions 64
-CORPUS=build/wiki-corpus MODE=slots ./scripts/benchmark.sh
-CORPUS=build/wiki-corpus MODE=fixed ./scripts/benchmark.sh
-```
+### Why scaling gets worse as the graph gets bigger
 
-### Public graph datasets
+The same slot sweep on two graphs of very different size, both on the CI runner:
 
-Run on a clean GitHub Actions runner (4 cores, AMD EPYC 7763, 15 GB RAM) so the
-numbers do not depend on any particular laptop. Trigger it yourself from the
-Actions tab, or:
-
-```bash
-gh workflow run benchmark.yml -f dataset=web-BerkStan -f partitions=32
-```
-
-These are standard published link-analysis graphs from
-[SNAP](https://snap.stanford.edu/data/), ingested with `--edges`. Extraction is
-checked against the published edge counts: web-BerkStan yields exactly
-7,600,595 links and soc-LiveJournal1 exactly 68,993,773, both matching the
-dataset headers.
-
-| dataset | nodes | edges | keys | max fan-in |
-|---|---|---|---|---|
-| web-BerkStan | 685,230 | 7,600,595 | 617,094 | 84,208 |
-| soc-LiveJournal1 | 4,847,571 | 68,993,773 | 4.3M sources | - |
-
-**web-BerkStan**, one node, varying `--slots`:
-
-| slots | map stage | speedup |
+| slots | web-BerkStan (7.6M edges) | soc-LiveJournal1 (69M edges) |
 |---|---|---|
-| 1 | 16,503 ms | 1.00x |
-| 2 | 8,482 ms | 1.95x |
-| 4 | 5,095 ms | 3.24x |
+| 1 | 16,503 ms (1.00x) | 115,028 ms (1.00x) |
+| 2 | 8,482 ms (1.95x) | 93,821 ms (1.23x) |
+| 4 | 5,095 ms (**3.24x**) | 83,477 ms (**1.38x**) |
 
-**soc-LiveJournal1**, 69M edges, same sweep:
+Nine times the data, and the benefit of extra slots falls from 3.24x to 1.38x.
 
-| slots | map stage | speedup |
-|---|---|---|
-| 1 | 115,028 ms | 1.00x |
-| 2 | 93,821 ms | 1.23x |
-| 4 | 83,477 ms | 1.38x |
+**Why.** A job has two parts: the map stage, which slots parallelize, and the
+reduce stage, which they do not. In this test there is one node, so there is one
+reducer, and **all 69 million edges funnel into it**.
 
-Scaling collapses on the larger graph: 3.24x at 7.6M edges, only 1.38x at 69M.
-Past a certain size the reduce side dominates and adding map parallelism stops
-helping, because every mapper is feeding the same two reducers and those become
-the constraint. 69M edges in 109 s end to end is roughly 830,000 edges/sec
-through the map stage.
+That reducer has to decode every edge, hash it, and insert it into a
+`Map<String, Set<String>>` that grows to 4.3 million keys. That work is serial and
+its size depends only on the dataset, not on how many map slots feed it.
 
-Splitting one machine into more node processes costs the same as it did on the
-laptop, measured here with total tasks held constant at 4:
+At 7.6M edges the reducer keeps up with the mappers, so making mappers faster
+makes the job faster. At 69M edges the reducer is the constraint, so faster
+mappers just queue behind it. More map threads even hurt slightly, by allocating
+faster and adding GC pressure.
 
-| layout | map stage | vs one node |
-|---|---|---|
-| 1 node x 4 slots | 5,021 ms | 1.00x |
-| 2 nodes x 2 slots | 5,716 ms | 0.88x |
-| 4 nodes x 1 slot | 6,015 ms | 0.83x |
+This is Amdahl's law with a specific culprit: the reduce stage is the serial
+fraction, and it grows with the data.
 
-### Where it breaks
+**The fix follows from the diagnosis:** add reducers, not slots. With
+`--reducers 4` each reducer would hold a quarter of the index and the serial
+fraction would shrink. I have not measured that, so treat it as the expected
+consequence rather than a result.
 
-soc-LiveJournal1 indexes fine on one node with an 11 GB heap. The same run split
-across 4 nodes capped at 5 GB each **fails**: with 2 reducers, each holds about
-34.5M edges, and that does not fit in 5 GB.
+### Why one reducer always finishes last
 
-So the ceiling is roughly **35M edges per reducer per 5 GB of heap**, or about
-150 bytes per edge after interning. To go past it, add reducers rather than
-heap, or implement disk-spilling reducers, which this does not do yet.
+Fan-in distribution from the Wikipedia run:
 
-This is the useful kind of failure: it fails loudly at ingest-to-index time
-rather than producing a quietly truncated index.
+| backlinks | number of keys |
+|---|---|
+| 1 | 91,504 |
+| 2-10 | 104,600 |
+| 11-100 | 62,982 |
+| 101-1,000 | 13,783 |
+| 1,000+ | 183 |
+
+Most keys have one or two backlinks. A handful have tens of thousands.
+`United_States` had 19,242. On web-BerkStan the biggest key had **84,208**.
+
+**Why this hurts.** Edges go to reducers by `hash(target) % reducers`, which
+spreads *keys* evenly. It does not spread *key sizes*, and key sizes here span
+five orders of magnitude. Whichever reducer happens to own `United_States` does
+far more work than the others and finishes last while the rest sit idle.
+
+Nothing here fixes that. It reports `max_fan_in` so the skew is at least visible
+instead of showing up as a mysteriously slow reducer.
+
+### Where it runs out of memory
+
+soc-LiveJournal1's 69M edges index fine on one node with an 11 GB heap. The same
+data split across 4 nodes capped at 5 GB each **fails**: with 2 reducers, each
+holds about 34.5M edges, and that does not fit.
+
+So the ceiling is roughly **35M edges per reducer per 5 GB of heap**, about 150
+bytes per edge.
+
+**Why 150 bytes for what is conceptually two pointers.** For each key the store
+holds a String, a hash map entry, and a `Set` — and that Set is itself a hash map
+costing roughly 200 bytes even when it holds a single element. Each edge inside it
+then costs another node object. With millions of keys, the per-key overhead
+dominates.
+
+Source URLs are interned, which turned out to be necessary rather than an
+optimization. A page with 43 outbound links contributes its own URL to 43
+different sets, and each batch decode allocates a fresh String. Before interning,
+the store held one String per *edge* instead of one per *page*, and 2.6M edges
+would not fit in a 512 MB heap. After interning, they do.
+
+To go past the ceiling: add reducers, or write reducers that spill to disk, which
+this does not do.
 
 ### Fault tolerance
 
@@ -248,8 +424,8 @@ rather than producing a quietly truncated index.
 ./scripts/failure-demo.sh
 ```
 
-Kills a node mid-job. The job finishes and the sorted output hash is unchanged,
-because every partition had a second replica.
+Runs a job normally, then runs it again killing a node partway through, and
+compares. The sorted output hash is **identical**.
 
 ```
 WARN  [cluster] node node-3 declared DEAD (control connection closed)
@@ -257,10 +433,17 @@ WARN  [sched]   part-004 will be rescheduled, lost with node node-3
 INFO  [control] replicating part-001 from node-1 to node-2
 ```
 
-Death is detected in milliseconds. Each node holds one control connection to the
-controller that is never pooled, so a dead process shows up as a closed socket
-rather than a timeout. Gossip between nodes covers the other case, a node that is
-hung but still connected.
+**Why it survives.** Two reasons. Every partition was on two machines (RF=2), so
+the dead node's data still exists somewhere. And the half-finished work the dead
+node already shipped is harmless, because re-running the task re-sends the same
+edges, and adding an edge to a `Set` twice does nothing.
+
+**Why the death is noticed in milliseconds** rather than after a timeout: each
+node holds one TCP connection to the controller that is never reused for anything
+else. When the process dies the operating system closes that socket, and a closed
+socket is unambiguous. Gossip between nodes covers the other case, a machine that
+has frozen but whose socket is still open, which the controller cannot detect on
+its own.
 
 ### Stragglers
 
@@ -268,7 +451,7 @@ hung but still connected.
 ./scripts/straggler-demo.sh
 ```
 
-One node is slowed artificially:
+One node is artificially slowed:
 
 ```
 map stage without speculation : 4332 ms
@@ -279,73 +462,69 @@ INFO [sched] straggler: part-009 on node-3 at 1036 ms vs median 73 ms,
 INFO [sched] backup attempt won for part-009, cancelling the original
 ```
 
-The backup finished in 55 ms because node-1 already had a replica.
+The backup finished in 55 ms because node-1 already had a copy of that partition,
+so it started work immediately instead of copying data first.
 
-Running a partition twice is safe here without a commit protocol: the reducer
-stores backlinks in a `Set`, so applying the same edge twice does nothing and
-both attempts converge on the same index. A reduce that summed or counted would
-need the loser fenced off first.
+**Why running the same task twice is safe here**, with no locking and no commit
+protocol: the reducer stores `Map<target, Set<source>>`. Applying the edge
+`(A, B)` twice gives exactly the same set as applying it once. Both attempts
+converge on an identical index however their output interleaves, so the loser can
+simply be cancelled and its partial output ignored.
 
-## Loading data
+**This is a property of this workload, not a general result.** A reduce that
+summed or counted would double-count, and would need the losing attempt properly
+fenced off before its output could be discarded.
 
-Wikipedia:
+### Reproducing
 
-```bash
-java -jar linkmesh.jar ingest --controller HOST:9000 \
-  --wikipedia simplewiki-NS0-ENTERPRISE-HTML.json.tar.gz --partitions 64
-```
+Correctness runs on every push via GitHub Actions: a 3-node run and a 1-node run
+must produce the same index, killing a node mid-job must not change the result,
+speculation must not change the result, and a hand-built WARC must normalize to an
+exact expected index.
 
-Common Crawl, or your own `wget --warc-file` crawl:
-
-```bash
-java -jar linkmesh.jar ingest --controller HOST:9000 --warc segment.warc.gz --partitions 64
-```
-
-WARC is required rather than a folder of `.html` files because each record
-carries `WARC-Target-URI`. Without knowing where a page was fetched from, a
-relative `href="/about"` cannot be resolved and the index comes out silently
-wrong.
-
-The ingester resolves relative links, honours `<base href>`, strips fragments,
-lowercases hosts, drops default ports and decodes entities. Skip any of that and
-`Example.com/x`, `example.com/x`, `example.com:80/x` and `example.com/x#top`
-become four separate keys.
-
-Then run a job:
+Benchmarks run on a clean runner, on demand:
 
 ```bash
-java -jar linkmesh.jar submit --controller HOST:9000
-java -jar linkmesh.jar status --controller HOST:9000
+gh workflow run benchmark.yml -f dataset=web-BerkStan -f partitions=32
 ```
+
+Locally:
+
+```bash
+java -jar build/linkmesh.jar ingest --edges web-BerkStan.txt.gz --out build/corpus --partitions 32
+CORPUS=build/corpus MODE=slots ./scripts/benchmark.sh
+CORPUS=build/corpus MODE=fixed ./scripts/benchmark.sh
+```
+
+---
 
 ## Sizing
 
-Reducer state lives in memory. Source URLs are interned, since a page with 43
-outbound links otherwise contributes 43 copies of its own URL. Without interning
-2.6M edges did not fit in a 512 MB heap; with it they do.
+Reducer memory is the binding constraint, at roughly 150 bytes per edge:
 
-| articles | edges | total reducer heap |
+| edges | total reducer heap | example |
 |---|---|---|
-| 60,000 | 2.6M | ~400 MB |
-| 165,000 | 7.0M | ~1.2 GB |
-| 500,000 | 21M | ~3.5 GB |
+| 2.6M | ~400 MB | 60k Wikipedia articles |
+| 7.0M | ~1.2 GB | 165k Wikipedia articles |
+| 69M | ~11 GB | soc-LiveJournal1 |
 
-Divide by reducer count for per-machine heap. Past roughly 10M edges per reducer
-you want disk-spilling reducers, which this does not do yet.
+Divide by reducer count for per-machine heap. Two reducers means each needs about
+half.
 
 ## Commands
 
 ```
 controller   run the controller
 worker       run a node (storage + compute + reducer)
-ingest       load a corpus: --wikipedia, --warc, --prepared, or --out to stage locally
+ingest       load a corpus: --wikipedia, --warc, --edges, --prepared,
+             or --out to parse to local disk without a cluster
 gen          generate a synthetic corpus
 submit       start a job
 status       cluster and job state
 cancel       cancel the running job
 ```
 
-`java -jar linkmesh.jar help` lists every flag. Any flag can also come from
+`java -jar linkmesh.jar help` lists every flag. Any flag can also be set from
 `LINKMESH_<FLAG>` in the environment.
 
 ## How it works
@@ -360,7 +539,7 @@ cancel       cancel the running job
                   +-- gossip mesh ----+
 ```
 
-Per node, the map stage is:
+Inside one node, a single map task looks like this:
 
 ```
 partition directory
@@ -372,11 +551,15 @@ BoundedTaskQueue          backpressure, instrumented
 parse page, emit edges -> batched shuffle to reducers
 ```
 
-Three concurrency tools, picked per workload: ForkJoin for the uneven directory
-tree, a fixed platform pool for uniform CPU-bound parsing, virtual threads for
-the many mostly-idle connections.
+Three different concurrency tools, each picked for its job. ForkJoin for scanning
+the directory tree, because the tree is uneven and work stealing balances it with
+no manual splitting. A fixed thread pool for parsing, because those tasks are
+uniform and CPU-bound so stealing would only add overhead. Virtual threads for
+network connections, because there are many and they spend almost all their time
+idle.
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the protocol, storage layout,
+placement planner and failure detection in detail.
 
 ```
 src/main/java/linkmesh/
@@ -386,23 +569,25 @@ src/main/java/linkmesh/
   storage/         local replica store
   controller/      scheduling, speculation, job state
   worker/          map pipeline, bounded queue, shuffle, reducer, gossip
-  ingest/          Wikipedia and WARC readers, link extraction, URL normalization
+  ingest/          Wikipedia, WARC and edge-list readers, URL normalization
 ```
 
-44 files, ~5,700 lines.
+45 files, about 6,100 lines.
 
 ## Limits
 
-- The controller is a single point of failure for scheduling. Data survives it,
-  running jobs do not.
-- Reducer state is in memory and unreplicated. Losing a reducer mid-job fails
-  the job.
-- Reducer skew is not addressed. One reducer gets the hot keys and finishes last.
-- Partition archives are buffered in memory during transfer. Prefer more
+- **The controller is a single point of failure for scheduling.** Data survives
+  it; a job running at the time does not.
+- **Reducer state is in memory and not replicated.** Losing a reducer mid-job
+  fails the job.
+- **Reducer skew is not handled.** One reducer gets the hot keys and finishes
+  last.
+- **Thread pools are rebuilt per task**, which is why `--slots` matters so much.
+- **Partition archives are held in memory during transfer.** Prefer more
   partitions over bigger ones.
-- No auth, no TLS. Trusted networks only.
-- Link extraction is regex-based rather than a real HTML parser.
+- **No authentication, no TLS.** Trusted networks only.
+- **Link extraction is regex-based**, not a real HTML parser.
 
 ## Requirements
 
-Java 21+. Bash for the helper scripts.
+Java 21 or newer. Bash for the helper scripts.
