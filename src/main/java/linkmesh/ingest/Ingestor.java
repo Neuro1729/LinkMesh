@@ -28,7 +28,7 @@ import java.util.List;
 public final class Ingestor {
     private static final Log log = Log.of("ingest");
 
-    public enum Format { WARC, WIKIPEDIA }
+    public enum Format { WARC, WIKIPEDIA, EDGES }
 
     public static final class Config {
         public Endpoint controller;
@@ -65,6 +65,10 @@ public final class Ingestor {
         return shard(inputs, Format.WIKIPEDIA, true);
     }
 
+    public Stats ingestEdges(List<Path> inputs) throws IOException {
+        return shard(inputs, Format.EDGES, true);
+    }
+
     /**
      * Parses a corpus into partition directories on local disk without pushing
      * it anywhere. Useful when the same corpus is loaded repeatedly, since
@@ -90,9 +94,11 @@ public final class Ingestor {
         try {
             for (Path input : inputs) {
                 log.info("reading %s", input.getFileName());
-                boolean more = format == Format.WARC
-                        ? readWarc(input, writers, counters)
-                        : readWikipedia(input, writers, counters);
+                boolean more = switch (format) {
+                    case WARC -> readWarc(input, writers, counters);
+                    case WIKIPEDIA -> readWikipedia(input, writers, counters);
+                    case EDGES -> readEdges(input, writers, counters);
+                };
                 if (!more) break;
             }
         } finally {
@@ -148,6 +154,37 @@ public final class Ingestor {
                 // usual same-site filter would discard the entire graph. Here
                 // the internal links are the point.
                 if (!accept(article.url(), article.html(), false, true, writers, counters)) return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Edge lists arrive already extracted, so this skips HTML parsing entirely
+     * and writes adjacency straight into the partition it hashes to.
+     */
+    private boolean readEdges(Path input, List<PartitionWriter> writers, Counters counters) throws IOException {
+        try (EdgeListReader reader = new EdgeListReader(input)) {
+            EdgeListReader.Adjacency adjacency;
+            while ((adjacency = reader.next()) != null) {
+                counters.recordsSeen++;
+                if (adjacency.targets().isEmpty()) { counters.skippedNoLinks++; continue; }
+
+                int partition = Hashing.bucket(adjacency.source(), config.partitions);
+                writers.get(partition).write(adjacency.source(), adjacency.targets());
+                counters.pagesWritten++;
+                counters.linksWritten += adjacency.targets().size();
+
+                if (counters.pagesWritten % 200_000 == 0) {
+                    log.info("%,d sources, %,d edges", counters.pagesWritten, counters.linksWritten);
+                }
+                if (counters.pagesWritten >= config.maxPages) {
+                    log.info("reached --maxPages limit of %,d", config.maxPages);
+                    return false;
+                }
+            }
+            if (reader.malformed() > 0) {
+                log.warn("skipped %,d malformed lines", reader.malformed());
             }
         }
         return true;

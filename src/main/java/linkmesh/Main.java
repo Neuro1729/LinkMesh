@@ -164,7 +164,11 @@ public final class Main {
 
     private static void runIngest(Args args) throws Exception {
         Ingestor.Config config = new Ingestor.Config();
-        config.controller = Endpoint.parse(args.require("controller"), DEFAULT_CONTROLLER_PORT);
+        // --out parses to local disk and never talks to a cluster, so the
+        // controller address is only required for the paths that push.
+        if (!args.has("out")) {
+            config.controller = Endpoint.parse(args.require("controller"), DEFAULT_CONTROLLER_PORT);
+        }
         config.partitions = args.getInt("partitions", 32);
         config.pagesPerFile = args.getInt("pagesPerFile", 200);
         config.externalOnly = !args.getBool("includeInternal", false);
@@ -180,9 +184,20 @@ public final class Main {
         try {
             Ingestor.Stats stats;
             if (extractOnly) {
-                Ingestor.Format format = args.has("wikipedia") ? Ingestor.Format.WIKIPEDIA : Ingestor.Format.WARC;
-                String spec = args.has("wikipedia") ? args.require("wikipedia") : args.require("warc");
-                List<Path> inputs = resolveInputs(spec, ".tar.gz", ".tgz", ".ndjson", ".warc", ".warc.gz");
+                Ingestor.Format format;
+                String spec;
+                if (args.has("wikipedia")) {
+                    format = Ingestor.Format.WIKIPEDIA;
+                    spec = args.require("wikipedia");
+                } else if (args.has("edges")) {
+                    format = Ingestor.Format.EDGES;
+                    spec = args.require("edges");
+                } else {
+                    format = Ingestor.Format.WARC;
+                    spec = args.require("warc");
+                }
+                List<Path> inputs = resolveInputs(spec, ".tar.gz", ".tgz", ".ndjson",
+                        ".warc", ".warc.gz", ".txt", ".txt.gz", ".edges");
                 if (inputs.isEmpty()) throw new IllegalArgumentException("no input files found");
                 System.out.println("Extracting " + inputs.size() + " file(s) to " + config.staging);
                 stats = ingestor.extractOnly(inputs, format);
@@ -194,6 +209,12 @@ public final class Main {
                 System.out.printf("Pushed %d prepared partitions (%s) in %s%n",
                         stats.partitionsPushed(), Text.humanBytes(stats.bytesPushed()),
                         Text.humanMillis(stats.elapsedMillis()));
+            } else if (args.has("edges")) {
+                List<Path> inputs = resolveInputs(args.require("edges"), ".txt", ".txt.gz", ".edges", ".gz");
+                if (inputs.isEmpty()) throw new IllegalArgumentException("no edge list files found");
+                System.out.println("Ingesting " + inputs.size() + " edge list file(s)");
+                stats = ingestor.ingestEdges(inputs);
+                printIngestSummary(stats);
             } else if (args.has("wikipedia")) {
                 List<Path> inputs = resolveInputs(args.require("wikipedia"), ".tar.gz", ".tgz", ".ndjson");
                 if (inputs.isEmpty()) throw new IllegalArgumentException("no Wikipedia dump files found");
@@ -356,6 +377,7 @@ public final class Main {
                     --controller HOST:PORT required
                     --warc FILE|DIR        WARC or WARC.GZ input
                     --wikipedia FILE|DIR   Wikipedia Enterprise HTML dump (.tar.gz)
+                    --edges FILE|DIR       plain edge list, "src dst" per line (.txt/.txt.gz)
                     --prepared DIR         push an already-partitioned directory
                     --out DIR              parse to DIR and stop (no cluster needed)
                     --partitions 32        number of partitions to create
