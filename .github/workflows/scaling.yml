@@ -1,0 +1,73 @@
+name: Scaling vs size
+
+# Answers one question with one dataset: does parallel speedup degrade as the
+# data grows, holding everything else constant?
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: 'SNAP dataset'
+        type: choice
+        default: soc-LiveJournal1
+        options:
+          - soc-LiveJournal1
+          - cit-Patents
+          - web-BerkStan
+      heap:
+        description: 'Node heap (held constant across sizes)'
+        default: '10g'
+      fractions:
+        description: 'Partition counts to test'
+        default: '16 32 64 128'
+
+jobs:
+  scaling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Runner specs
+        run: |
+          echo "cores : $(nproc)"
+          free -g | awk 'NR==2 {print "memory: " $2 " GB"}'
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - name: Fetch and parse dataset
+        run: |
+          mkdir -p build/graphs
+          curl -sS --retry 3 --max-time 900             -o "build/graphs/${{ github.event.inputs.dataset }}.txt.gz"             "https://snap.stanford.edu/data/${{ github.event.inputs.dataset }}.txt.gz"
+          java -Xmx2g -jar build/linkmesh.jar ingest             --edges "build/graphs/${{ github.event.inputs.dataset }}.txt.gz"             --out build/corpus --partitions 128 --pagesPerFile 2000
+
+      - name: Scaling vs size
+        run: |
+          CORPUS=build/corpus           FRACTIONS="${{ github.event.inputs.fractions }}"           NODE_HEAP="${{ github.event.inputs.heap }}"           SLOTS_LIST="1 2 4" TRIALS=1             ./scripts/scaling-vs-size.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Scaling vs size: ${{ github.event.inputs.dataset }}"
+            echo
+            echo "Heap held constant at ${{ github.event.inputs.heap }}, 1 node, 1 reducer."
+            echo
+            echo '```'
+            column -s, -t < output/scaling-vs-size.csv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: scaling-vs-size
+          path: |
+            output/scaling-vs-size.csv
+            logs/gc-*.log
+          retention-days: 30

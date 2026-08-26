@@ -14,6 +14,7 @@ NODE_ARGS="${NODE_ARGS:-}"
 SLOW_NODE="${SLOW_NODE:-}"
 SLOW_DELAY_MS="${SLOW_DELAY_MS:-60}"
 NODE_HEAP="${NODE_HEAP:-512m}"
+NODE_JAVA_OPTS="${NODE_JAVA_OPTS:-}"
 CONTROLLER_HEAP="${CONTROLLER_HEAP:-512m}"
 
 mkdir -p logs output
@@ -32,7 +33,7 @@ for i in $(seq 1 "$NODES"); do
     EXTRA="--parseDelayMs $SLOW_DELAY_MS"
     echo "  node-$i is the designated slow node (${SLOW_DELAY_MS}ms per file)"
   fi
-  java "-Xmx${NODE_HEAP}" -jar build/linkmesh.jar worker \
+  java "-Xmx${NODE_HEAP}" $NODE_JAVA_OPTS -jar build/linkmesh.jar worker \
     --controller "127.0.0.1:$CONTROLLER_PORT" \
     --id "node-$i" --port "$((7100 + i))" --advertise 127.0.0.1 \
     --data "linkmesh-data/node-$i" $NODE_ARGS $EXTRA > "logs/node-$i.log" 2>&1 &
