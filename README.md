@@ -259,12 +259,13 @@ now reports what recovery cost:
 
 ```
 node_failures=1              tasks_rescheduled=1
-failure_last_contact_ms=475  replications_issued=8
-replication_recovery_ms=1355
+failure_last_contact_ms=736  replications_issued=8
+replication_recovery_ms=2060
 ```
 
-One task redone, 8 partition copies issued, and full replication restored 1.4 s
-after the loss. RF=2 means the data survives, and re-running the task re-sends
+One task redone, 8 partition copies issued, and full replication restored 2.1 s
+after the loss. Killing a node on a real 4-machine cluster instead: 3 tasks
+rescheduled and full replication restored in **3.0 s** across the network. RF=2 means the data survives, and re-running the task re-sends
 the same edges, which a `Set` absorbs.
 
 `failure_last_contact_ms` is staleness of the last heartbeat when the node was
@@ -362,6 +363,10 @@ src/main/java/linkmesh/
 - Shuffle blocks on every batch, so batch size matters a lot across a network.
 - Thread pools are rebuilt per task, which is why `--slots` matters so much.
 - Partition archives are buffered in memory during transfer.
+- A partition can be republished while a map task is reading it, so the task can
+  hit `NoSuchFileException` mid-scan. The duplicate-push guard only helps once the
+  first store has published. It is rescheduled and the job finishes, but it is
+  real; found on a 4-machine failure run.
 - No auth, no TLS.
 - Link extraction is regex-based, not a real HTML parser.
 
