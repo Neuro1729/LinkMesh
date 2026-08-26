@@ -212,6 +212,13 @@ jobs:
           for t in $(seq 1 "$TRIALS"); do
             java -jar build/linkmesh.jar submit --controller 127.0.0.1:9000 --job "multi-$t"
             MS=$(grep 'METRIC map_stage_ms' logs/controller.log | tail -1 | cut -d= -f2)
+            # submit can return without the job having finished, which would
+            # leave no metrics and still pass the step. Insist on a number.
+            if [ -z "$MS" ]; then
+              echo "::error::job produced no map_stage_ms metric; it did not complete"
+              tail -40 logs/controller.log
+              exit 1
+            fi
             echo "trial $t: map ${MS} ms"
             if [ -z "$BEST" ] || [ "$MS" -lt "$BEST" ]; then BEST="$MS"; fi
           done
