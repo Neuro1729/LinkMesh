@@ -286,7 +286,13 @@ public final class Controller implements AutoCloseable {
     private void applyPlacementPlan() {
         if (cluster.aliveCount() == 0) return;
         List<PlacementPlanner.Move> moves = planner.plan(placement, cluster);
+        Set<String> beingRead = partitionsWithRunningAttempts();
         for (PlacementPlanner.Move move : moves) {
+            // An on-demand task fetch creates a replica the planner never asked
+            // for, which reads as over-replication and schedules a DROP. Dropping
+            // the copy a task is reading is exactly the wrong choice, so leave it
+            // until the job stops using it; the surplus is reclaimed next tick.
+            if (move.kind() == PlacementPlanner.Kind.DROP && beingRead.contains(move.partition())) continue;
             String key = move.kind() + ":" + move.partition() + ":" + move.target();
             if (!inFlightReplications.add(key)) continue;
             replicationsIssued.incrementAndGet();
@@ -302,6 +308,14 @@ public final class Controller implements AutoCloseable {
                 }
             });
         }
+    }
+
+    private Set<String> partitionsWithRunningAttempts() {
+        JobState current = job;
+        if (current == null || current.isComplete() || current.isCancelled()) return Set.of();
+        Set<String> partitions = new HashSet<>();
+        for (TaskAttempt attempt : current.allRunningAttempts()) partitions.add(attempt.partition);
+        return partitions;
     }
 
     private void executeReplicate(PlacementPlanner.Move move) {
@@ -324,7 +338,14 @@ public final class Controller implements AutoCloseable {
         NodeInfo node = cluster.get(move.source());
         if (node == null || !node.isAlive()) return;
         try {
-            pool.request(node.endpoint, Message.of(Verbs.STORE_DROP, "partition", move.partition())).orThrow();
+            Message reply = pool.request(node.endpoint,
+                    Message.of(Verbs.STORE_DROP, "partition", move.partition())).orThrow();
+            // The node refuses while a task is still reading. Leaving placement
+            // untouched keeps the map honest, so the next plan retries the drop.
+            if (!Boolean.parseBoolean(reply.get("dropped", "false"))) {
+                log.debug("%s kept its replica of %s, still in use", node.id, move.partition());
+                return;
+            }
             placement.remove(move.partition(), node.id);
             log.info("dropped surplus replica of %s from %s", move.partition(), node.id);
         } catch (IOException | RuntimeException e) {

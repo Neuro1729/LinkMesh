@@ -317,16 +317,28 @@ public final class Worker implements AutoCloseable {
                 fetchPartition(partition, new Endpoint(sourceHost, sourcePort));
             }
 
-            Path root = store.pathOf(partition);
-            try (ShuffleWriter shuffle = new ShuffleWriter(jobId, reducers, pool, shuffleBatch)) {
-                MapPipeline pipeline = new MapPipeline(root, shuffle, parserThreads, queueCapacity, parseDelay);
-                runningTasks.put(attemptId, pipeline);
-                try {
-                    MapPipeline.Result result = pipeline.run();
-                    reportSuccess(jobId, attemptId, partition, result);
-                } finally {
-                    runningTasks.remove(attemptId);
+            // Pin the replica for the whole scan. Re-replication and the placement
+            // rebalancer both target partitions this node holds, and a task reads
+            // by path, so an unpinned partition can be dropped or republished
+            // mid-scan and the files disappear underneath the parser.
+            if (!store.acquire(partition)) {
+                reportFailure(jobId, attemptId, partition, "partition vanished before the task could start");
+                return;
+            }
+            try {
+                Path root = store.pathOf(partition);
+                try (ShuffleWriter shuffle = new ShuffleWriter(jobId, reducers, pool, shuffleBatch)) {
+                    MapPipeline pipeline = new MapPipeline(root, shuffle, parserThreads, queueCapacity, parseDelay);
+                    runningTasks.put(attemptId, pipeline);
+                    try {
+                        MapPipeline.Result result = pipeline.run();
+                        reportSuccess(jobId, attemptId, partition, result);
+                    } finally {
+                        runningTasks.remove(attemptId);
+                    }
                 }
+            } finally {
+                store.release(partition);
             }
         } catch (CancellationException e) {
             log.info("attempt %s cancelled", attemptId);

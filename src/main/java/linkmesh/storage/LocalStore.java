@@ -36,6 +36,12 @@ public final class LocalStore {
     private final Map<String, PartitionMeta> inventory = new ConcurrentHashMap<>();
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
 
+    // Map tasks read a partition by path, not by open handle: the scan enumerates
+    // Paths and the parser opens them much later. Anything that unlinks the
+    // directory in between makes files vanish mid-scan. Readers register here so
+    // drop and republish can leave a partition that is being read alone.
+    private final Map<String, Integer> readers = new ConcurrentHashMap<>();
+
     public LocalStore(Path root) throws IOException {
         this.root = root.toAbsolutePath().normalize();
         this.partitionsDir = this.root.resolve("partitions");
@@ -96,6 +102,30 @@ public final class LocalStore {
         return partitionsDir.resolve(id);
     }
 
+    /**
+     * Pins a partition for reading. Returns false if it is not held, in which
+     * case the caller has nothing to read. Every successful acquire must be
+     * matched by a release, or the replica can never be reclaimed.
+     */
+    public boolean acquire(String id) {
+        synchronized (lockFor(id)) {
+            if (!inventory.containsKey(id)) return false;
+            readers.merge(id, 1, Integer::sum);
+            return true;
+        }
+    }
+
+    public void release(String id) {
+        synchronized (lockFor(id)) {
+            readers.computeIfPresent(id, (key, count) -> count <= 1 ? null : count - 1);
+        }
+    }
+
+    /** How many map tasks are currently reading this partition. */
+    public int readerCount(String id) {
+        return readers.getOrDefault(id, 0);
+    }
+
     /** Streams a partition out as an archive, for replication to a peer. */
     public Archive.Written pack(String id, OutputStream sink) throws IOException {
         if (!has(id)) throw new IllegalStateException("partition not held locally: " + id);
@@ -117,12 +147,20 @@ public final class LocalStore {
             // make its files vanish mid-scan. Duplicate pushes are routine after
             // a node dies, when re-replication and an on-demand task fetch can
             // both target the same node at once.
-            if (expectedSha != null && !expectedSha.isBlank()) {
-                PartitionMeta existing = inventory.get(id);
-                if (existing != null && expectedSha.equals(existing.sha256())) {
-                    log.debug("already hold %s with matching digest, skipping rewrite", id);
-                    return existing;
-                }
+            PartitionMeta existing = inventory.get(id);
+            if (existing != null && expectedSha != null && !expectedSha.isBlank()
+                    && expectedSha.equals(existing.sha256())) {
+                log.debug("already hold %s with matching digest, skipping rewrite", id);
+                return existing;
+            }
+            // A digest that does not match should not happen, since partition
+            // content is immutable once ingested. If it does, the copy already on
+            // disk is the one a running task is reading, so keep it and let the
+            // sender retry on a later tick rather than pulling the directory out
+            // from under the reader.
+            if (existing != null && readerCount(id) > 0) {
+                log.warn("%s is being read by %d task(s), deferring rewrite", id, readerCount(id));
+                return existing;
             }
             Path staging = tmpDir.resolve(id + "-" + UUID.randomUUID());
             try {
@@ -167,8 +205,11 @@ public final class LocalStore {
             // safely while the new one is published.
             Path retired = tmpDir.resolve(id + "-retired-" + UUID.randomUUID());
             try {
+                // Left in tmp rather than deleted: a reader that already opened a
+                // file keeps its handle valid, and clearTmp() reclaims the space on
+                // the next start. Deleting here would unlink those files while they
+                // are still being read.
                 Files.move(destination, retired);
-                deleteRecursively(retired);
             } catch (IOException e) {
                 deleteRecursively(destination);
             }
@@ -182,8 +223,18 @@ public final class LocalStore {
         return meta;
     }
 
+    /**
+     * Removes a replica. Refuses while a map task is reading the partition: the
+     * reader holds paths rather than handles, so deleting under it makes files
+     * vanish mid-scan. The caller re-plans on a later tick, by which point the
+     * task has finished and the surplus replica goes away then.
+     */
     public boolean drop(String id) {
         synchronized (lockFor(id)) {
+            if (readerCount(id) > 0) {
+                log.info("not dropping %s, %d task(s) still reading it", id, readerCount(id));
+                return false;
+            }
             PartitionMeta removed = inventory.remove(id);
             if (removed == null) return false;
             deleteRecursively(partitionsDir.resolve(id));

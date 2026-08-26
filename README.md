@@ -356,6 +356,55 @@ src/main/java/linkmesh/
 
 45 files, about 6,100 lines.
 
+### The replica deleted out from under a running task
+
+A 4-machine failure run turned up map tasks dying on
+`NoSuchFileException: .../pages-000001.page`. The job still finished, because a
+failed task is just rescheduled, but the cause was worth chasing.
+
+A map task reads a partition **by path, not by open handle**. The scan enumerates
+`Path` objects into a bounded queue and the parser opens them much later, so
+there is a window as wide as the queue is deep in which the files it is about to
+open can be unlinked.
+
+Two things widen that window into a real bug. An on-demand task fetch stores a
+replica the planner never asked for, and the controller only learns of it on the
+next inventory sweep. Placement then reads RF+1 holders and schedules a DROP of
+the surplus, picking the *most loaded* holder -- often the node that just fetched
+it and is reading it right now.
+
+Reproduce it, no failure injection needed beyond a node rejoining with its old
+replicas still on disk:
+
+```bash
+./scripts/reader-drop-demo.sh
+```
+
+```
+INFO  [control] dropped surplus replica of part-010 from node-1
+WARN  [map] map failure: NoSuchFileException: .../part-010/bucket-5/sub-1/pages-000019.page
+```
+
+The fix is a reader count in the store, not a bigger lock. `runTask` pins the
+partition for the length of the scan; `drop` refuses while the count is above
+zero and the controller re-plans on the next tick; the rebalancer skips any
+partition with an in-flight attempt. Both layers hold on their own -- with the
+controller-side skip disabled, the node still refuses:
+
+```
+INFO [store] not dropping part-007, 1 task(s) still reading it
+INFO [sched] part-007 complete on node-1 in 2041 ms
+INFO [control] dropped surplus replica of part-007 from node-1
+```
+
+Refused while read, dropped 200 ms after the task finished. Three runs hit the
+race before the fix, three were clean after, and it is now a CI step.
+
+`publish` had the same hazard in milder form: it renamed the live directory aside
+and deleted it immediately, with a comment claiming open handles kept readers
+safe. True for a descriptor already open, not for a path not yet opened. The
+retired copy now stays in `tmp/` until the next start.
+
 ## Limits
 
 - Controller is a single point of failure for scheduling. Data survives it,
@@ -365,10 +414,8 @@ src/main/java/linkmesh/
 - Shuffle blocks on every batch, so batch size matters a lot across a network.
 - Thread pools are rebuilt per task, which is why `--slots` matters so much.
 - Partition archives are buffered in memory during transfer.
-- A partition can be republished while a map task is reading it, so the task can
-  hit `NoSuchFileException` mid-scan. The duplicate-push guard only helps once the
-  first store has published. It is rescheduled and the job finishes, but it is
-  real; found on a 4-machine failure run.
+- A refused drop is retried on the next planning tick rather than queued, so a
+  surplus replica can outlive the job that pinned it by a few seconds.
 - No auth, no TLS.
 - Link extraction is regex-based, not a real HTML parser.
 
