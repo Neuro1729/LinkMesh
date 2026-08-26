@@ -350,18 +350,43 @@ own hardware. GitHub Actions gives every job in a matrix its own VM, 4 cores and
 15 GB, so the nodes are put on separate runners and joined over a Tailscale
 network. Setup is in [docs/OPERATING.md](docs/OPERATING.md).
 
-web-BerkStan, 7.6M edges, 4 slots per machine, `--shuffleBatch 8192`:
+web-BerkStan, 7.6M edges, `--shuffleBatch 8192`. Each machine runs one node, and
+`--slots` is how many map tasks that node runs at once, so the work in flight is
+machines x slots:
 
-| worker machines | map stage | speedup |
+| machines | slots each | tasks at once | map stage | vs 1x1 |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 18,655 ms | 1.00x |
+| 2 | 1 | 2 | 14,049 ms | 1.33x |
+| 4 | 1 | 4 | 8,731 ms | 2.14x |
+| 1 | 4 | 4 | 4,631 ms | 4.03x |
+| 2 | 4 | 8 | 3,891 ms | 4.79x |
+| 4 | 4 | 16 | 2,681 ms | **6.96x** |
+
+Read down either slots column and adding machines helps: 1.00 to 1.33 to 2.14 at
+one slot each, 1.00 to 1.19 to 1.73 at four. Read across and filling a machine's
+slots helps more.
+
+Every one of the six produced the identical 617,094-key index.
+
+**Fill a machine before adding another.** Compare the two rows with 4 tasks in
+flight:
+
+| layout | tasks | map stage |
 |---|---|---|
-| 1 | 4,631 ms | 1.00x |
-| 2 | 3,891 ms | 1.19x |
-| 4 | 2,681 ms | **1.73x** |
+| 1 machine x 4 slots | 4 | 4,631 ms |
+| 4 machines x 1 slot | 4 | 8,731 ms |
 
-Adding machines makes it faster. Sublinear, because `--reducers 2` caps the
-reduce side however many mappers feed it and the corpus is small enough that
-fixed per-run costs still show. But the direction is finally the right one, and
-all three produced the identical 617,094-key index.
+Same concurrency, and the single machine is **1.89x faster**. Spreading the same
+work over more machines means shuffle traffic crosses the network instead of
+staying in one process. So use the cores you already have first, then add
+machines for the parallelism you cannot get locally, which is what the 4x4 row
+does.
+
+Scaling is sublinear: 16 tasks give 6.96x, not 16x. `--reducers 2` caps the
+reduce side however many mappers feed it, and at 7.6M edges the fixed per-run
+costs, distributing data and collecting output across the network, are a visible
+share of a run this short.
 
 ### The bug that only a real network could reveal
 
