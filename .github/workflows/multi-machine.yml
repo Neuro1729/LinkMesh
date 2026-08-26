@@ -45,6 +45,9 @@ on:
       kill_worker:
         description: 'Kill this worker mid-map to measure recovery (0 = none)'
         default: '0'
+      parse_delay:
+        description: 'Artificial ms per file, to lengthen the map stage for kill tests'
+        default: '0'
 
 jobs:
   # Workers and the controller start at the same time on purpose. There is no
@@ -119,7 +122,11 @@ jobs:
                 if [ "$PHASE" = "MAP" ]; then
                   sleep 4
                   echo "::warning::killing w${{ matrix.id }} mid-map to exercise recovery"
-                  kill -9 "$WORKER_PID" 2>/dev/null || true
+                  # pkill the JVM itself. WORKER_PID is the timeout wrapper,
+                  # and SIGKILL is not forwarded to its child, so killing that
+                  # left the worker running and the death was only noticed by
+                  # the deadMs timeout instead of the closed socket.
+                  pkill -9 -f 'linkmesh.jar worker' 2>/dev/null || true
                   exit 0
                 fi
                 sleep 1
@@ -174,7 +181,7 @@ jobs:
           nohup java -Xmx2g -jar build/linkmesh.jar controller \
             --port 9000 --replication "$RF" --reducers "$REDUCERS" \
             --minSpeculativeMs 100000 \
-            --shuffleBatch "${{ github.event.inputs.shuffle_batch }}" \
+            --shuffleBatch "${{ github.event.inputs.shuffle_batch }}"             --parseDelayMs "${{ github.event.inputs.parse_delay }}" \
             --output output/backlinks.tsv > logs/controller.log 2>&1 &
 
           echo "waiting for $WORKERS worker(s) to join the tailnet and register"

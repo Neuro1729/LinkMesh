@@ -66,6 +66,8 @@ public final class Controller implements AutoCloseable {
     private final AtomicLong replicationsIssued = new AtomicLong();
     private final AtomicLong recoveryMillis = new AtomicLong(-1);
     private volatile long degradedSinceNanos = 0;
+    private final AtomicLong inventoryRefreshes = new AtomicLong();
+    private volatile long refreshesAtDeath = -1;
     private final AtomicLong outputLines = new AtomicLong();
     private final CountDownLatch jobFinished = new CountDownLatch(1);
     private final Object outputLock = new Object();
@@ -256,8 +258,9 @@ public final class Controller implements AutoCloseable {
      */
     private void refreshInventories() {
         if (closed) return;
+        List<Future<?>> pending = new ArrayList<>();
         for (NodeInfo node : cluster.alive()) {
-            background.submit(() -> {
+            pending.add(background.submit(() -> {
                 try {
                     Message reply = pool.request(node.endpoint, Message.of(Verbs.STORE_LIST));
                     if (reply.isError()) return;
@@ -267,8 +270,17 @@ public final class Controller implements AutoCloseable {
                 } catch (IOException e) {
                     log.debug("inventory refresh failed for %s: %s", node.id, e.getMessage());
                 }
-            });
+            }));
         }
+        // Count the sweep only once every node has answered. Incrementing on
+        // submission would let the recovery check believe placement was fresh
+        // while the replies were still outstanding.
+        background.submit(() -> {
+            for (Future<?> future : pending) {
+                try { future.get(); } catch (Exception ignored) { }
+            }
+            inventoryRefreshes.incrementAndGet();
+        });
     }
 
     private void applyPlacementPlan() {
@@ -339,7 +351,10 @@ public final class Controller implements AutoCloseable {
         } else {
             log.info("node %s lost, its partitions remain available on other replicas", node.id);
         }
-        if (degradedSinceNanos == 0) degradedSinceNanos = System.nanoTime();
+        if (degradedSinceNanos == 0) {
+            degradedSinceNanos = System.nanoTime();
+            refreshesAtDeath = inventoryRefreshes.get();
+        }
     }
 
     /**
@@ -349,6 +364,12 @@ public final class Controller implements AutoCloseable {
      */
     private void checkRecovered() {
         if (degradedSinceNanos == 0) return;
+        // Placement is only as fresh as the last inventory sweep. Without waiting
+        // for one after the death, the map still shows the dead node's replicas
+        // and everything looks fully replicated, which closed this window in
+        // 158 ms while 19 transfers were still in flight.
+        if (inventoryRefreshes.get() <= refreshesAtDeath) return;
+        if (!inFlightReplications.isEmpty()) return;
         int factor = Math.min(planner.replicationFactor(), cluster.aliveCount());
         for (String partition : placement.sortedPartitions()) {
             if (placement.confirmedAliveHolders(partition, cluster).size() < factor) return;
