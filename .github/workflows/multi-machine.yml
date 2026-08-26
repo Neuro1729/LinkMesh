@@ -156,7 +156,16 @@ jobs:
             [ "$joined" -ge "$WORKERS" ] && break
             sleep 2
           done
-          grep "joined as" logs/controller.log || { echo "no workers joined"; tail -40 logs/controller.log; exit 1; }
+          # Insist on the full complement. Runner queueing can leave some worker
+          # jobs unstarted, and proceeding anyway would silently produce a result
+          # labelled with more machines than actually took part.
+          joined=$(grep -c "joined as" logs/controller.log || true)
+          grep "joined as" logs/controller.log || true
+          if [ "$joined" -ne "$WORKERS" ]; then
+            echo "::error::asked for $WORKERS worker machines but $joined joined; refusing to report a mislabelled result"
+            tail -40 logs/controller.log
+            exit 1
+          fi
           sleep 5
           java -jar build/linkmesh.jar status --controller 127.0.0.1:9000
 
