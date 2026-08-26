@@ -177,6 +177,71 @@ CORPUS=build/wiki-corpus MODE=slots ./scripts/benchmark.sh
 CORPUS=build/wiki-corpus MODE=fixed ./scripts/benchmark.sh
 ```
 
+### Public graph datasets
+
+Run on a clean GitHub Actions runner (4 cores, AMD EPYC 7763, 15 GB RAM) so the
+numbers do not depend on any particular laptop. Trigger it yourself from the
+Actions tab, or:
+
+```bash
+gh workflow run benchmark.yml -f dataset=web-BerkStan -f partitions=32
+```
+
+These are standard published link-analysis graphs from
+[SNAP](https://snap.stanford.edu/data/), ingested with `--edges`. Extraction is
+checked against the published edge counts: web-BerkStan yields exactly
+7,600,595 links and soc-LiveJournal1 exactly 68,993,773, both matching the
+dataset headers.
+
+| dataset | nodes | edges | keys | max fan-in |
+|---|---|---|---|---|
+| web-BerkStan | 685,230 | 7,600,595 | 617,094 | 84,208 |
+| soc-LiveJournal1 | 4,847,571 | 68,993,773 | 4.3M sources | - |
+
+**web-BerkStan**, one node, varying `--slots`:
+
+| slots | map stage | speedup |
+|---|---|---|
+| 1 | 16,503 ms | 1.00x |
+| 2 | 8,482 ms | 1.95x |
+| 4 | 5,095 ms | 3.24x |
+
+**soc-LiveJournal1**, 69M edges, same sweep:
+
+| slots | map stage | speedup |
+|---|---|---|
+| 1 | 115,028 ms | 1.00x |
+| 2 | 93,821 ms | 1.23x |
+| 4 | 83,477 ms | 1.38x |
+
+Scaling collapses on the larger graph: 3.24x at 7.6M edges, only 1.38x at 69M.
+Past a certain size the reduce side dominates and adding map parallelism stops
+helping, because every mapper is feeding the same two reducers and those become
+the constraint. 69M edges in 109 s end to end is roughly 830,000 edges/sec
+through the map stage.
+
+Splitting one machine into more node processes costs the same as it did on the
+laptop, measured here with total tasks held constant at 4:
+
+| layout | map stage | vs one node |
+|---|---|---|
+| 1 node x 4 slots | 5,021 ms | 1.00x |
+| 2 nodes x 2 slots | 5,716 ms | 0.88x |
+| 4 nodes x 1 slot | 6,015 ms | 0.83x |
+
+### Where it breaks
+
+soc-LiveJournal1 indexes fine on one node with an 11 GB heap. The same run split
+across 4 nodes capped at 5 GB each **fails**: with 2 reducers, each holds about
+34.5M edges, and that does not fit in 5 GB.
+
+So the ceiling is roughly **35M edges per reducer per 5 GB of heap**, or about
+150 bytes per edge after interning. To go past it, add reducers rather than
+heap, or implement disk-spilling reducers, which this does not do yet.
+
+This is the useful kind of failure: it fails loudly at ingest-to-index time
+rather than producing a quietly truncated index.
+
 ### Fault tolerance
 
 ```bash
