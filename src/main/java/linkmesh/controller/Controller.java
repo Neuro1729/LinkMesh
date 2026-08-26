@@ -57,6 +57,15 @@ public final class Controller implements AutoCloseable {
     private final ExecutorService background = Executors.newVirtualThreadPerTaskExecutor();
 
     private final Set<String> inFlightReplications = ConcurrentHashMap.newKeySet();
+
+    // Recovery accounting. "Survived a node failure" is a weak claim on its own;
+    // these turn it into how fast it was noticed, how much work had to be redone,
+    // and how long the cluster ran below its replication factor.
+    private final AtomicLong nodeFailures = new AtomicLong();
+    private final AtomicLong lastContactMillis = new AtomicLong(-1);
+    private final AtomicLong replicationsIssued = new AtomicLong();
+    private final AtomicLong recoveryMillis = new AtomicLong(-1);
+    private volatile long degradedSinceNanos = 0;
     private final AtomicLong outputLines = new AtomicLong();
     private final CountDownLatch jobFinished = new CountDownLatch(1);
     private final Object outputLock = new Object();
@@ -231,6 +240,7 @@ public final class Controller implements AutoCloseable {
         try {
             for (NodeInfo dead : cluster.sweep()) handleNodeDeath(dead);
             applyPlacementPlan();
+            checkRecovered();
             driveJob();
         } catch (RuntimeException e) {
             log.warn("maintenance pass failed: %s: %s", e.getClass().getSimpleName(), e.getMessage());
@@ -267,6 +277,7 @@ public final class Controller implements AutoCloseable {
         for (PlacementPlanner.Move move : moves) {
             String key = move.kind() + ":" + move.partition() + ":" + move.target();
             if (!inFlightReplications.add(key)) continue;
+            replicationsIssued.incrementAndGet();
             background.submit(() -> {
                 try {
                     if (move.kind() == PlacementPlanner.Kind.REPLICATE) {
@@ -310,6 +321,13 @@ public final class Controller implements AutoCloseable {
     }
 
     private void handleNodeDeath(NodeInfo node) {
+        nodeFailures.incrementAndGet();
+        // How stale the last contact was when the node was declared dead. This
+        // is not detection latency: when the control connection drops the
+        // declaration is immediate, and this just shows how long ago the last
+        // heartbeat happened to be. It matters for the other path, where a node
+        // goes quiet with its socket still open and this climbs toward deadMillis.
+        lastContactMillis.set(node.silentMillis());
         pool.evict(node.endpoint);
         JobScheduler current = scheduler;
         if (current != null) current.onNodeLost(node.id);
@@ -321,6 +339,24 @@ public final class Controller implements AutoCloseable {
         } else {
             log.info("node %s lost, its partitions remain available on other replicas", node.id);
         }
+        if (degradedSinceNanos == 0) degradedSinceNanos = System.nanoTime();
+    }
+
+    /**
+     * Closes the degraded window once every partition is back to full
+     * replication, so recovery time covers the actual copying rather than just
+     * the moment the loss was noticed.
+     */
+    private void checkRecovered() {
+        if (degradedSinceNanos == 0) return;
+        int factor = Math.min(planner.replicationFactor(), cluster.aliveCount());
+        for (String partition : placement.sortedPartitions()) {
+            if (placement.confirmedAliveHolders(partition, cluster).size() < factor) return;
+        }
+        long millis = (System.nanoTime() - degradedSinceNanos) / 1_000_000L;
+        degradedSinceNanos = 0;
+        recoveryMillis.set(millis);
+        log.info("cluster back to full replication after %d ms", millis);
     }
 
     // --------------------------------------------------------------- job flow
@@ -464,6 +500,15 @@ public final class Controller implements AutoCloseable {
         Log.metric("backlink_keys", keys);
         Log.metric("backlink_edges", edges);
         Log.metric("max_fan_in", maxFanIn);
+        Log.metric("reduce_stage_ms", Math.max(0, totalMillis - mapStageMillis));
+        Log.metric("tasks_local", current.localLaunches());
+        Log.metric("tasks_fetched", current.fetchLaunches());
+        Log.metric("locality_pct", String.format("%.1f", current.localityRate() * 100));
+        Log.metric("node_failures", nodeFailures.get());
+        if (lastContactMillis.get() >= 0) Log.metric("failure_last_contact_ms", lastContactMillis.get());
+        Log.metric("tasks_rescheduled", current.rescheduledAfterLoss());
+        Log.metric("replications_issued", replicationsIssued.get());
+        if (recoveryMillis.get() >= 0) Log.metric("replication_recovery_ms", recoveryMillis.get());
         Log.metric("speculative_attempts", current.speculativeAttemptCount());
         Log.metric("speculative_wins", current.speculativeWins());
         Log.metric("connections_opened", pool.connectionsOpened());

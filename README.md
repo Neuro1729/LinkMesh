@@ -94,6 +94,12 @@ multi-machine tests each node gets its own runner joined over Tailscale.
 
 Every configuration below produced a byte-identical index, checked by SHA-256.
 
+Each job also reports `locality_pct`, the share of tasks that ran on a node
+already holding the partition rather than fetching it. It is 100% on every run
+here, which is the point of storing data on the nodes at all: with RF=2 and
+partitions well spread, the scheduler almost never has to move bytes to find a
+free machine.
+
 ### Datasets
 
 | dataset | nodes | edges | keys | max fan-in |
@@ -248,9 +254,23 @@ not fit in 512 MB; after, they do.
 ./scripts/straggler-demo.sh    # slows one node down
 ```
 
-Killing a node mid-job leaves the sorted output hash **unchanged**: RF=2 means the
-data survives, and re-running the task re-sends the same edges, which a `Set`
-absorbs. Death is detected in milliseconds because each node holds one dedicated
+Killing a node mid-job leaves the sorted output hash **unchanged**, and the job
+now reports what recovery cost:
+
+```
+node_failures=1              tasks_rescheduled=1
+failure_last_contact_ms=475  replications_issued=8
+replication_recovery_ms=1355
+```
+
+One task redone, 8 partition copies issued, and full replication restored 1.4 s
+after the loss. RF=2 means the data survives, and re-running the task re-sends
+the same edges, which a `Set` absorbs.
+
+`failure_last_contact_ms` is staleness of the last heartbeat when the node was
+declared dead, not detection latency: on the connection-close path the
+declaration is immediate. It matters for the other path, where a node goes quiet
+with its socket still open and this climbs toward `--deadMs`. Death is detected in milliseconds because each node holds one dedicated
 TCP connection to the controller, so a dead process shows as a closed socket
 rather than a timeout. Gossip covers the other case, a node hung with its socket
 still open.

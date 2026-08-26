@@ -176,6 +176,7 @@ public final class JobScheduler {
     private void launch(String partition, NodeInfo node, NodeInfo source, boolean speculative) {
         TaskAttempt attempt = job.newAttempt(partition, node.id, speculative);
         node.taskStarted();
+        job.recordLaunch(source != null);
 
         Message request = Message.of(Verbs.RUN_TASK,
                 "job", job.jobId,
@@ -257,6 +258,7 @@ public final class JobScheduler {
             attempt.fail("node lost");
             if (!job.isDone(attempt.partition) && job.runningAttempts(attempt.partition).isEmpty()) {
                 log.warn("%s will be rescheduled, lost with node %s", attempt.partition, nodeId);
+                job.recordRescheduleAfterLoss();
             }
         }
     }

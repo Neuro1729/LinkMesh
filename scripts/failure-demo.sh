@@ -50,6 +50,9 @@ echo "baseline sha256 : $BASE  ($(wc -l < output/baseline.tsv) keys)"
 echo "failure  sha256 : $AFTER  ($(wc -l < output/backlinks.tsv) keys)"
 if [ "$BASE" = "$AFTER" ]; then
   echo "IDENTICAL - the node death did not change the result."
+  echo
+  echo "== recovery =="
+  grep -E "METRIC (node_failures|failure_last_contact_ms|tasks_rescheduled|replications_issued|replication_recovery_ms)" logs/controller.log     | sed 's/METRIC /  /' || true
 else
   echo "MISMATCH - results diverged, investigate."
   exit 1

@@ -23,6 +23,13 @@ public final class JobState {
     private final List<Long> completedDurations = new CopyOnWriteArrayList<>();
     private final AtomicInteger attemptCounter = new AtomicInteger();
 
+    // Scheduling quality counters. Locality is the reason nodes store data at
+    // all, so how often a task actually ran where its bytes already were is
+    // worth reporting rather than assuming.
+    private final AtomicInteger localLaunches = new AtomicInteger();
+    private final AtomicInteger fetchLaunches = new AtomicInteger();
+    private final AtomicInteger rescheduledAfterLoss = new AtomicInteger();
+
     private volatile boolean cancelled;
     private volatile String failure;
 
@@ -150,6 +157,25 @@ public final class JobState {
         }
         return total;
     }
+
+    public void recordLaunch(boolean neededFetch) {
+        if (neededFetch) fetchLaunches.incrementAndGet();
+        else localLaunches.incrementAndGet();
+    }
+
+    public int localLaunches() { return localLaunches.get(); }
+
+    public int fetchLaunches() { return fetchLaunches.get(); }
+
+    /** Share of task launches that ran on a node already holding the partition. */
+    public double localityRate() {
+        int total = localLaunches.get() + fetchLaunches.get();
+        return total == 0 ? 1.0 : (double) localLaunches.get() / total;
+    }
+
+    public void recordRescheduleAfterLoss() { rescheduledAfterLoss.incrementAndGet(); }
+
+    public int rescheduledAfterLoss() { return rescheduledAfterLoss.get(); }
 
     public int speculativeAttemptCount() {
         int count = 0;
