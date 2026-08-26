@@ -39,6 +39,9 @@ on:
       trials:
         description: 'Job runs to take the median of'
         default: '3'
+      shuffle_batch:
+        description: 'Records per shuffle batch (each batch is one blocking round trip)'
+        default: '512'
 
 jobs:
   # Workers and the controller start at the same time on purpose. There is no
@@ -181,6 +184,7 @@ jobs:
             echo "| dataset | \`$DATASET\` |"
             echo "| worker machines | $WORKERS (4 cores each, separate VMs) |"
             echo "| slots per worker | ${{ github.event.inputs.slots }} |"
+            echo "| shuffle batch | ${{ github.event.inputs.shuffle_batch }} |"
             echo "| best map stage | ${BEST_MAP_MS:-n/a} ms |"
             echo
             echo '```'
