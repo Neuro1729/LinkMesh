@@ -147,6 +147,7 @@ jobs:
           nohup java -Xmx2g -jar build/linkmesh.jar controller \
             --port 9000 --replication "$RF" --reducers "$REDUCERS" \
             --minSpeculativeMs 100000 \
+            --shuffleBatch "${{ github.event.inputs.shuffle_batch }}" \
             --output output/backlinks.tsv > logs/controller.log 2>&1 &
 
           echo "waiting for $WORKERS worker(s) to join the tailnet and register"
