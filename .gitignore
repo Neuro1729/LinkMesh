@@ -1,0 +1,8 @@
+build/
+linkmesh-data/
+logs/*
+!logs/.gitkeep
+output/*
+!output/.gitkeep
+*.class
+.DS_Store
