@@ -42,6 +42,9 @@ on:
       shuffle_batch:
         description: 'Records per shuffle batch (each batch is one blocking round trip)'
         default: '512'
+      kill_worker:
+        description: 'Kill this worker mid-map to measure recovery (0 = none)'
+        default: '0'
 
 jobs:
   # Workers and the controller start at the same time on purpose. There is no
@@ -100,7 +103,31 @@ jobs:
             --advertise "$TSIP" \
             --slots "${{ github.event.inputs.slots }}" \
             --parserThreads 2 \
-            --data "linkmesh-data/w${{ matrix.id }}" || true
+            --data "linkmesh-data/w${{ matrix.id }}" &
+          WORKER_PID=$!
+
+          # The designated victim waits for the job to actually reach the map
+          # stage before dying. Killing on a fixed timer would land somewhere
+          # different on every run, depending on how long the download and
+          # ingest happened to take.
+          if [ "${{ github.event.inputs.kill_worker }}" = "${{ matrix.id }}" ]; then
+            (
+              for _ in $(seq 1 900); do
+                PHASE=$(java -jar build/linkmesh.jar status \
+                  --controller "lm-controller-${{ github.run_id }}:9000" 2>/dev/null \
+                  | grep '^phase=' | cut -d= -f2 || true)
+                if [ "$PHASE" = "MAP" ]; then
+                  sleep 4
+                  echo "::warning::killing w${{ matrix.id }} mid-map to exercise recovery"
+                  kill -9 "$WORKER_PID" 2>/dev/null || true
+                  exit 0
+                fi
+                sleep 1
+              done
+            ) &
+          fi
+
+          wait "$WORKER_PID" || true
           echo "worker exited"
 
   controller:
@@ -195,10 +222,17 @@ jobs:
             echo "| worker machines | $WORKERS (4 cores each, separate VMs) |"
             echo "| slots per worker | ${{ github.event.inputs.slots }} |"
             echo "| shuffle batch | ${{ github.event.inputs.shuffle_batch }} |"
+            echo "| killed worker | ${{ github.event.inputs.kill_worker }} |"
             echo "| best map stage | ${BEST_MAP_MS:-n/a} ms |"
             echo
             echo '```'
             grep METRIC logs/controller.log || true
+            echo '```'
+            echo
+            echo "Locality and recovery:"
+            echo '```'
+            grep -E "METRIC (locality_pct|tasks_local|tasks_fetched|node_failures|tasks_rescheduled|replications_issued|replication_recovery_ms|reduce_stage_ms)" \
+              logs/controller.log || true
             echo '```'
             echo
             echo '```'
