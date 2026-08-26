@@ -342,6 +342,63 @@ This is also a real inefficiency, not just a tuning fact. Building thread pools
 per task is wasteful, and reusing them across tasks on a node would shrink the
 gap. Not done yet.
 
+### Adding real machines: the one test a single host cannot do
+
+Every result above runs on one machine, where splitting into more node processes
+only ever costs. To find out whether adding *machines* helps, each node needs its
+own hardware. GitHub Actions gives every job in a matrix its own VM, 4 cores and
+15 GB, so the nodes are put on separate runners and joined over a Tailscale
+network. Setup is in [docs/OPERATING.md](docs/OPERATING.md).
+
+web-BerkStan, 7.6M edges, 4 slots per machine, `--shuffleBatch 8192`:
+
+| worker machines | map stage | speedup |
+|---|---|---|
+| 1 | 4,631 ms | 1.00x |
+| 2 | 3,891 ms | 1.19x |
+| 4 | 2,681 ms | **1.73x** |
+
+Adding machines makes it faster. Sublinear, because `--reducers 2` caps the
+reduce side however many mappers feed it and the corpus is small enough that
+fixed per-run costs still show. But the direction is finally the right one, and
+all three produced the identical 617,094-key index.
+
+### The bug that only a real network could reveal
+
+The first multi-machine attempt was a disaster, and worth keeping:
+
+| workers | shuffle batch | map stage |
+|---|---|---|
+| 1 | 512 | 6,341 ms |
+| 2 | 512 | **39,976 ms** |
+| 4 | 512 | 23,697 ms |
+
+Two machines were **six times slower** than one. Not overhead; something broken.
+
+**Why.** `ShuffleWriter` sends a batch and blocks for the reply. On one machine
+the reducer is the same process and that reply costs almost nothing, so a batch
+size of 512 was invisible. Across real machines every batch became a network
+round trip: 7.6M edges at 512 records is about 14,800 batches, half of them
+crossing the wire, so roughly 7,000 blocking round trips through a WireGuard
+tunnel between two datacenters. That is the entire 34-second gap.
+
+Raising only the batch size, changing nothing else:
+
+| workers=2, shuffle batch | map stage |
+|---|---|
+| 512 | 39,976 ms |
+| 8192 | 3,891 ms |
+
+**10.3x faster**, and it turned "two machines are 6x slower" into "two machines
+are 1.19x faster." The default is now 4096 rather than 512.
+
+The real fix is to stop blocking on every batch and pipeline the sends, which
+would make the batch size much less critical. Not done yet.
+
+This is the argument for testing on real hardware. The bug was invisible on
+loopback, invisible on one runner, and invisible in every benchmark above it,
+because they all had a shuffle whose round trips were free.
+
 ### Why splitting one machine into more nodes is slower
 
 Same total work in flight (4 concurrent tasks), just divided across more node
