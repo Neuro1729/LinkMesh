@@ -1,0 +1,201 @@
+name: Multi-machine benchmark
+
+# The one thing a single host cannot show: does adding real machines make it
+# faster?
+#
+# Every other benchmark here runs on one machine, so splitting it into more node
+# processes only ever costs. This puts each node on its own GitHub runner, with
+# its own 4 cores and 15 GB, and joins them over a Tailscale network so they can
+# actually reach each other. Runners are isolated by default and have no route
+# between them, which is the whole reason the VPN is here.
+#
+# Needs a TS_AUTHKEY repo secret: a Tailscale auth key that is reusable,
+# ephemeral, and tagged. See docs/OPERATING.md.
+#
+# Trigger once per worker count and compare, e.g. workers=1, then 2, then 4.
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Number of worker machines'
+        type: choice
+        default: '2'
+        options: ['1', '2', '3', '4']
+      dataset:
+        description: 'SNAP dataset'
+        type: choice
+        default: web-BerkStan
+        options:
+          - web-BerkStan
+          - web-Google
+          - cit-Patents
+      partitions:
+        description: 'Partition count'
+        default: '32'
+      slots:
+        description: 'Slots per worker'
+        default: '4'
+      trials:
+        description: 'Job runs to take the median of'
+        default: '3'
+
+jobs:
+  # Workers and the controller start at the same time on purpose. There is no
+  # needs: between them, because a job that depends on another only starts once
+  # that one has *finished*, which is useless when both must run concurrently.
+  # They find each other by MagicDNS name instead of by passing an address
+  # around, and the worker retries the connection until the controller answers.
+  worker:
+    name: worker ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [1, 2, 3, 4]
+    steps:
+      - name: Skip unused workers
+        id: check
+        run: |
+          if [ "${{ matrix.id }}" -gt "${{ github.event.inputs.workers }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.check.outputs.skip == 'false'
+
+      - uses: actions/setup-java@v5
+        if: steps.check.outputs.skip == 'false'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: tailscale/github-action@v4
+        if: steps.check.outputs.skip == 'false'
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --hostname=lm-worker-${{ github.run_id }}-${{ matrix.id }}
+
+      - name: Run node
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          ./scripts/build.sh
+          echo "cores: $(nproc), memory: $(free -g | awk 'NR==2{print $2}') GB"
+
+          # Address detection picks the runner's own private IP, which no other
+          # runner can route to. The tailnet address is the only one that works.
+          TSIP=$(tailscale ip -4 | head -1)
+          echo "tailnet address: $TSIP"
+
+          mkdir -p linkmesh-data
+          timeout 2100 java -Xmx9g -jar build/linkmesh.jar worker \
+            --controller "lm-controller-${{ github.run_id }}:9000" \
+            --id "w${{ matrix.id }}" \
+            --advertise "$TSIP" \
+            --slots "${{ github.event.inputs.slots }}" \
+            --parserThreads 2 \
+            --data "linkmesh-data/w${{ matrix.id }}" || true
+          echo "worker exited"
+
+  controller:
+    name: controller and results
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATASET: ${{ github.event.inputs.dataset }}
+      PARTITIONS: ${{ github.event.inputs.partitions }}
+      WORKERS: ${{ github.event.inputs.workers }}
+      TRIALS: ${{ github.event.inputs.trials }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --hostname=lm-controller-${{ github.run_id }}
+
+      - name: Build and fetch dataset
+        run: |
+          ./scripts/build.sh
+          echo "cores: $(nproc), tailnet: $(tailscale ip -4 | head -1)"
+          mkdir -p build/graphs
+          curl -sS --retry 3 --max-time 900 \
+            -o "build/graphs/$DATASET.txt.gz" \
+            "https://snap.stanford.edu/data/$DATASET.txt.gz"
+          java -Xmx2g -jar build/linkmesh.jar ingest \
+            --edges "build/graphs/$DATASET.txt.gz" \
+            --out build/corpus --partitions "$PARTITIONS" --pagesPerFile 2000
+
+      - name: Start controller and wait for workers
+        run: |
+          mkdir -p logs output
+          REDUCERS=2
+          [ "$WORKERS" -lt 2 ] && REDUCERS=1
+          RF=2
+          [ "$WORKERS" -lt 2 ] && RF=1
+
+          nohup java -Xmx2g -jar build/linkmesh.jar controller \
+            --port 9000 --replication "$RF" --reducers "$REDUCERS" \
+            --minSpeculativeMs 100000 \
+            --output output/backlinks.tsv > logs/controller.log 2>&1 &
+
+          echo "waiting for $WORKERS worker(s) to join the tailnet and register"
+          for i in $(seq 1 300); do
+            joined=$(grep -c "joined as" logs/controller.log || true)
+            [ "$joined" -ge "$WORKERS" ] && break
+            sleep 2
+          done
+          grep "joined as" logs/controller.log || { echo "no workers joined"; tail -40 logs/controller.log; exit 1; }
+          sleep 5
+          java -jar build/linkmesh.jar status --controller 127.0.0.1:9000
+
+      - name: Distribute data and run the job
+        run: |
+          time java -jar build/linkmesh.jar ingest --controller 127.0.0.1:9000 --prepared build/corpus
+          java -jar build/linkmesh.jar status --controller 127.0.0.1:9000
+
+          BEST=""
+          for t in $(seq 1 "$TRIALS"); do
+            java -jar build/linkmesh.jar submit --controller 127.0.0.1:9000 --job "multi-$t"
+            MS=$(grep 'METRIC map_stage_ms' logs/controller.log | tail -1 | cut -d= -f2)
+            echo "trial $t: map ${MS} ms"
+            if [ -z "$BEST" ] || [ "$MS" -lt "$BEST" ]; then BEST="$MS"; fi
+          done
+          echo "BEST_MAP_MS=$BEST" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Multi-machine: $WORKERS worker machine(s)"
+            echo
+            echo "| setting | value |"
+            echo "|---|---|"
+            echo "| dataset | \`$DATASET\` |"
+            echo "| worker machines | $WORKERS (4 cores each, separate VMs) |"
+            echo "| slots per worker | ${{ github.event.inputs.slots }} |"
+            echo "| best map stage | ${BEST_MAP_MS:-n/a} ms |"
+            echo
+            echo '```'
+            grep METRIC logs/controller.log || true
+            echo '```'
+            echo
+            echo '```'
+            grep "joined as" logs/controller.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: multi-machine-${{ github.event.inputs.workers }}-workers
+          path: logs/
+          retention-days: 30

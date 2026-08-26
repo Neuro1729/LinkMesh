@@ -528,3 +528,64 @@ java -jar linkmesh.jar cancel --controller HOST:9000
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally, and the
 [README](../README.md) for the demo scripts.
+
+---
+
+## Appendix: multi-machine benchmarking on GitHub Actions
+
+Every benchmark in the README runs on one machine, which can never show whether
+adding machines helps. Splitting one host into more node processes only costs.
+
+GitHub Actions gives each job in a matrix its own VM: 4 cores, 15 GB, free and
+unmetered on public repos. Runners have no network route to each other, so they
+are joined into a Tailscale network to make a real cluster out of them.
+
+### One-time setup
+
+1. Create a free account at [tailscale.com](https://tailscale.com). You do **not**
+   need to install Tailscale on your own computer; the runners are the devices.
+
+2. Admin console, Access controls. Add a tag the CI nodes can claim:
+
+   ```json
+   "tagOwners": {
+     "tag:ci": ["autogroup:admin"]
+   }
+   ```
+
+3. Admin console, Settings, Keys, Generate auth key:
+   - **Reusable**: on (several runners use the same key)
+   - **Ephemeral**: on (nodes remove themselves when the job ends)
+   - **Tags**: `tag:ci`
+
+   Copy the key. It is shown once.
+
+4. Store it as a repository secret, without pasting it anywhere else:
+
+   ```bash
+   gh secret set TS_AUTHKEY --repo <owner>/<repo>
+   ```
+
+### Running it
+
+```bash
+gh workflow run multi-machine.yml -f workers=1 -f dataset=web-BerkStan
+gh workflow run multi-machine.yml -f workers=2 -f dataset=web-BerkStan
+gh workflow run multi-machine.yml -f workers=4 -f dataset=web-BerkStan
+```
+
+Each run reports its best map-stage time in the job summary. Comparing the three
+gives the curve that a single host cannot produce.
+
+### How the jobs find each other
+
+The controller and the workers start at the same time, with no `needs:` between
+them, because a dependent job only starts after the other has finished. Instead
+each joins the tailnet under a predictable MagicDNS name derived from the run id,
+and workers dial `lm-controller-<run_id>:9000`. A worker retries the connection
+indefinitely, so it does not matter which job is ready first.
+
+One detail worth knowing if you adapt this: workers must pass
+`--advertise $(tailscale ip -4)`. Automatic address detection picks the runner's
+own private address, which no other runner can route to. The tailnet address is
+the only one that works.
