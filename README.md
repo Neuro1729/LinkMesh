@@ -31,18 +31,11 @@ shuffle, and it is the whole job.
 
 | term | meaning |
 |---|---|
-| **edge** | one link, `(source, target)` |
-| **key** | a target URL in the index, with its set of sources |
-| **fan-in** | how many pages link to one key |
-| **partition** | a chunk of the corpus, sharded by `hash(source)`. Unit of storage and of work |
-| **map stage** | read pages, emit edges. Parallel across partitions |
+| **partition** | a chunk of corpus sharded by `hash(source)`. Unit of storage and of work |
 | **shuffle** | send each edge to the node owning its target, via `hash(target) % reducers` |
-| **reduce stage** | group arrivals into `Map<target, Set<source>>` |
-| **controller** | one process: membership, placement, scheduling, output. Holds no data |
-| **node** | stores partitions, runs map tasks, maybe acts as reducer. All three at once |
-| **reducer** | a node holding part of the index in memory for a job. The role that costs RAM |
+| **reducer** | a node holding part of the index in memory. The role that costs RAM |
 | **slots** | concurrent map tasks per node. The main throughput knob |
-| **replication factor** | copies of each partition. Default 2 |
+| **RF** | replication factor, copies of each partition. Default 2 |
 
 ## Running a cluster
 
@@ -58,9 +51,8 @@ java -Xmx8g -jar linkmesh.jar worker --controller HOST:9000 --role reducer
 ```
 
 Node id, address, port and data directory are derived. A node reports what it
-already holds on rejoin, so restarts are cheap.
-
-Full guide including firewall rules: [docs/OPERATING.md](docs/OPERATING.md).
+already holds on rejoin, so restarts are cheap. Full guide including firewall
+rules: [docs/OPERATING.md](docs/OPERATING.md).
 
 ## Loading data
 
@@ -72,35 +64,24 @@ java -jar linkmesh.jar ingest --controller HOST:9000 --warc segment.warc.gz --pa
 java -jar linkmesh.jar ingest --controller HOST:9000 --edges web-BerkStan.txt.gz --partitions 32
 
 java -jar linkmesh.jar submit --controller HOST:9000
-java -jar linkmesh.jar status --controller HOST:9000
 ```
 
 WARC rather than a folder of `.html` files, because a saved page has lost the URL
-it came from and `href="/about"` cannot be resolved without it. The index would
-come out wrong without complaining.
-
-URLs are normalized: host lowercased, fragment dropped, default port dropped,
-relative links resolved against `<base href>`, entities decoded. Skip that and
-`example.com/x`, `example.com/x#top` and `example.com:443/x` become three keys.
-Same-site links are dropped by default, since most links on a page are the site's
-own navigation. Wikipedia is the exception and keeps them.
+it came from and `href="/about"` cannot be resolved without it — the index would
+come out wrong without complaining. URLs are normalized (host lowercased,
+fragment and default port dropped, relatives resolved against `<base href>`,
+entities decoded); skip that and `example.com/x`, `example.com/x#top` and
+`example.com:443/x` become three keys.
 
 ---
 
-## Results
+# Results
 
-Two machines. **Laptop**: 8 cores, 5.7 GB. **CI runner**: 4 cores, 15 GB, and for
-multi-machine tests each node gets its own runner joined over Tailscale.
+**Laptop**: 8 cores, 5.7 GB. **CI runner**: 4 cores, 15 GB. For multi-machine
+tests each node gets its own runner, joined over Tailscale — separate hosts with
+their own cores and a real network between them, not processes on one box.
 
 Every configuration below produced a byte-identical index, checked by SHA-256.
-
-Each job also reports `locality_pct`, the share of tasks that ran on a node
-already holding the partition rather than fetching it. It is 100% on every run
-here, which is the point of storing data on the nodes at all: with RF=2 and
-partitions well spread, the scheduler almost never has to move bytes to find a
-free machine.
-
-### Datasets
 
 | dataset | nodes | edges | keys | max fan-in |
 |---|---|---|---|---|
@@ -111,33 +92,7 @@ free machine.
 The SNAP graphs publish exact edge counts, so extraction is self-checking: it
 produced exactly 7,600,595 and exactly 68,993,773.
 
-### Wikipedia, one node, 4 slots
-
-```
-map stage 10.2 s   total 16.8 s   164,601 pages   7,049,474 links   273,052 keys
-```
-
-About 16,000 pages/sec. Output is 358 MB of TSV.
-
-### Slots are the knob that matters
-
-One node, 61,322 articles, varying `--slots`:
-
-| slots | map stage | speedup |
-|---|---|---|
-| 1 | 12,378 ms | 1.00x |
-| 2 | 6,372 ms | 1.94x |
-| 4 | 3,618 ms | 3.42x |
-| 8 | 3,621 ms | 3.42x |
-
-Widening `--parserThreads` from 2 to 8 instead: 12,376 ms, no change.
-
-A task builds its own thread pools, scans, parses, flushes, tears them down. Only
-the parsing is parallel inside a task, and a partition holds ~11 files, so extra
-threads idle. Overlapping whole tasks is what wins. Flat past 4 because 4 slots x
-2 threads saturates 8 cores. `--slots` now defaults to cores/2.
-
-### More machines: yes. More processes on one machine: no
+## What real machines buy
 
 Each node on its own runner, web-BerkStan, `--shuffleBatch 8192`:
 
@@ -155,8 +110,8 @@ one machine at 4 slots is 4,631 ms, four machines at 1 slot is 8,731 ms. Same
 concurrency, **1.89x apart**, because spreading the work pushes shuffle traffic
 onto the network.
 
-Splitting a *single* host into more node processes is strictly worse, with total
-tasks held at 4:
+Splitting a *single* host into more node processes is strictly worse, total tasks
+held at 4:
 
 | layout | laptop | CI runner |
 |---|---|---|
@@ -167,7 +122,7 @@ tasks held at 4:
 Four JVMs on one box do not create four machines of CPU. They add heaps, GC
 threads, and a TCP hop where a method call used to be.
 
-### The bug only a real network could show
+## The bug only a real network could show
 
 First multi-machine attempt, `--shuffleBatch 512`:
 
@@ -191,71 +146,36 @@ Changing only the batch size, at 2 machines:
 **10.3x**, turning "6x slower" into "1.19x faster". Default is now 4096. The real
 fix is to pipeline sends instead of blocking on each one. Not done yet.
 
-### Speedup does not degrade with graph size
+## What one box hides
 
-One dataset fed progressively more of itself, heap fixed at 10g, one reducer:
+Three things are only visible once the nodes are actually separate.
 
-| edges | vs smallest | speedup at 4 slots |
-|---|---|---|
-| 7.4M | 1.0x | 1.29x |
-| 17.2M | 2.3x | 1.48x |
-| 34.5M | 4.7x | 1.42x |
-| 69.0M | 9.3x | 1.33x |
+**Locality stops being free.** On a single machine `locality_pct` is 100% on
+every run. On 4 machines with 16 slots:
 
-Flat across 9.3x more data. Per-edge cost does rise 21% over that range as the
-reducer's hash table outgrows cache, but it hits serial and parallel runs alike.
-
-An earlier version of this README claimed scaling degraded with size, comparing
-BerkStan at 3.24x against LiveJournal at 1.38x. That comparison also changed
-partition count, heap and trial count, and at equal size the gap is still there:
-7.4M edges of LiveJournal gives 1.29x where 7.6M of BerkStan gives 3.24x. It is a
-difference between graphs, not sizes. LiveJournal has far more distinct nodes per
-edge, so a much larger hash table.
-
-### Skew
-
-Fan-in on the Wikipedia run:
-
-| backlinks | keys |
-|---|---|
-| 1 | 91,504 |
-| 2-10 | 104,600 |
-| 11-100 | 62,982 |
-| 101-1,000 | 13,783 |
-| 1,000+ | 183 |
-
-`hash(target) % reducers` spreads keys evenly, not key *sizes*, and sizes span
-five orders of magnitude. Whichever reducer owns `United_States` finishes last.
-`max_fan_in` is reported so the skew is visible.
-
-### Memory ceiling
-
-69M edges index on one node with an 11 GB heap. Split across 4 nodes at 5 GB each
-they **fail**: 2 reducers means ~34.5M edges each, which does not fit.
-
-Roughly **35M edges per reducer per 5 GB**, about 150 bytes per edge. Most of that
-is per-key overhead: each key holds a String, a map entry, and a `Set` that is
-itself a hash map costing ~200 bytes even with one element.
-
-| edges | total reducer heap |
-|---|---|
-| 2.6M | ~400 MB |
-| 7.0M | ~1.2 GB |
-| 69M | ~11 GB |
-
-Source URLs are interned. A page with 43 links contributes its URL to 43 sets,
-and each batch decode allocated a fresh String. Before interning, 2.6M edges did
-not fit in 512 MB; after, they do.
-
-### Failure and stragglers
-
-```bash
-./scripts/failure-demo.sh      # kills a node mid-job
-./scripts/straggler-demo.sh    # slows one node down
+```
+tasks_local=30  tasks_fetched=2  locality_pct=93.8
 ```
 
-Killing a node mid-job leaves the sorted output hash **unchanged**, and the job
-now reports what recovery cost:
+Both holders of a partition are sometimes busy, so an idle machine fetches it
+instead of waiting. That trade only exists when there are real machines to be
+idle.
+
+**Reduce dominates, not map.** On the same run, `map_stage_ms=3729` against
+`reduce_stage_ms=10506` — reduce is **2.8x** the map stage, because output
+streams back to the controller over the network. In-process, it barely showed.
+
+**Recovery is slower than loopback suggests.** Killing a node on the real
+4-machine cluster: 3 tasks rescheduled, full replication restored in **3.0 s**.
+The same kill on loopback restores in 2.1 s.
+
+## Killing a node
+
+```bash
+./scripts/failure-demo.sh
+```
+
+The sorted output hash is **unchanged**, and the job reports what recovery cost:
 
 ```
 node_failures=1              tasks_rescheduled=1
@@ -263,30 +183,105 @@ failure_last_contact_ms=736  replications_issued=8
 replication_recovery_ms=2060
 ```
 
-One task redone, 8 partition copies issued, and full replication restored 2.1 s
-after the loss. Killing a node on a real 4-machine cluster instead: 3 tasks
-rescheduled and full replication restored in **3.0 s** across the network.
-
-RF=2 means the data survives, and re-running the task re-sends the same edges,
+RF=2 means the data survives, and re-running a task re-sends the same edges,
 which a `Set` absorbs.
 
-`failure_last_contact_ms` is staleness of the last heartbeat when the node was
-declared dead, not detection latency: on the connection-close path the
-declaration is immediate. It matters for the other path, where a node goes quiet
-with its socket still open and this climbs toward `--deadMs`. Death is detected in milliseconds because each node holds one dedicated
-TCP connection to the controller, so a dead process shows as a closed socket
-rather than a timeout. Gossip covers the other case, a node hung with its socket
-still open.
+`failure_last_contact_ms` is heartbeat staleness at the moment of declaration,
+not detection latency: each node holds one dedicated TCP connection to the
+controller, so a dead process shows as a closed socket in milliseconds. It
+matters for the other path, where a node goes quiet with its socket still open.
 
-Speculation: 4,332 ms without, 3,533 ms with. A straggler at 1,036 ms against a
-73 ms median got a backup that finished in 55 ms, because that machine already
-held a replica.
+Getting that number honest took three tries. It first read 158 ms while 19
+transfers were still in flight, because placement is only as fresh as the last
+inventory sweep. And the kill was hitting the wrong process — `kill -9` targeted
+a `timeout` wrapper, and SIGKILL is not forwarded to children, so the worker
+survived to the 8 s `--deadMs` path instead of the fast one.
 
-Running a task twice needs no commit protocol here, because applying an edge
-twice to a `Set` is a no-op. A reduce that summed or counted would need the loser
-fenced off first.
+**Stragglers** (`./scripts/straggler-demo.sh`): 4,332 ms without speculation,
+3,533 ms with. A straggler at 1,036 ms against a 73 ms median got a backup that
+finished in 55 ms, because that machine already held a replica. Running a task
+twice needs no commit protocol here, since applying an edge twice to a `Set` is a
+no-op. A reduce that summed or counted would need the loser fenced off first.
 
-### Reproducing
+## The replica deleted out from under a running task
+
+The 4-machine failure run turned up map tasks dying on `NoSuchFileException`. The
+job still finished — a failed task is just rescheduled — but the cause was worth
+chasing.
+
+A map task reads a partition **by path, not by open handle**: the scan enumerates
+`Path` objects into a bounded queue and the parser opens them much later, so the
+files it is about to open can be unlinked in between. Measured, that window ran
+to six seconds.
+
+An on-demand task fetch stores a replica the planner never asked for, and the
+controller only learns of it on the next inventory sweep. Placement then reads
+RF+1 holders and schedules a DROP of the surplus, picking the *most loaded*
+holder — often the node that just fetched it and is reading it right now.
+
+```bash
+./scripts/reader-drop-demo.sh
+```
+
+```
+INFO  [control] dropped surplus replica of part-010 from node-1
+WARN  [map] map failure: NoSuchFileException: .../part-010/bucket-5/sub-1/pages-000019.page
+```
+
+The fix is a reader count in the store, not a bigger lock. `runTask` pins the
+partition for the scan; `drop` refuses while the count is above zero and the
+controller re-plans next tick; the rebalancer skips partitions with an in-flight
+attempt. Both layers hold alone — with the controller-side skip disabled, the
+node still refuses:
+
+```
+INFO [store] not dropping part-007, 1 task(s) still reading it
+INFO [sched] part-007 complete on node-1 in 2041 ms
+INFO [control] dropped surplus replica of part-007 from node-1
+```
+
+Refused while read, dropped 200 ms after the task finished. Three runs hit the
+race before the fix, three were clean after, and it is now a CI step.
+
+`publish` had the same hazard in milder form: it renamed the live directory aside
+and deleted it immediately, with a comment claiming open handles kept readers
+safe — true for a descriptor already open, not for a path not yet opened. The
+retired copy now stays in `tmp/` until the next start.
+
+## On one machine
+
+Wikipedia, one node, 4 slots: **10.2 s** map stage, 16.8 s total, 164,601 pages,
+7,049,474 links. About 16,000 pages/sec, 358 MB of TSV out.
+
+Varying `--slots` on 61,322 articles: 12,378 ms at 1, 6,372 at 2 (1.94x), 3,618
+at 4 (3.42x), 3,621 at 8 (3.42x). Widening `--parserThreads` from 2 to 8 instead
+changes nothing (12,376 ms). Only the parsing is parallel inside a task and a
+partition holds ~11 files, so extra threads idle — overlapping whole tasks is
+what wins. Flat past 4 because 4 slots x 2 threads saturates 8 cores. `--slots`
+now defaults to cores/2.
+
+**Speedup holds as the graph grows.** Heap fixed at 10g: 1.29x at 7.4M edges,
+1.48x at 17.2M, 1.42x at 34.5M, 1.33x at 69.0M — flat across 9.3x more data. An
+earlier version of this README read that as scaling degrading with size, but at
+equal size the gap is between *graphs*, not sizes: 7.4M edges of LiveJournal
+gives 1.29x where 7.6M of BerkStan gives 3.24x, because LiveJournal has far more
+distinct nodes per edge and so a much larger hash table.
+
+**Skew is the reduce-side ceiling.** Fan-in on the Wikipedia run runs from 91,504
+keys with a single backlink to 183 keys with over a thousand. `hash(target) %
+reducers` spreads keys evenly, not key *sizes*, and sizes span five orders of
+magnitude, so whichever reducer owns `United_States` finishes last. `max_fan_in`
+is reported to keep that visible.
+
+**Memory ceiling**: roughly **35M edges per reducer per 5 GB**, about 150 bytes
+per edge. 69M edges index on one node with an 11 GB heap; split across 4 nodes at
+5 GB each they *fail*, since 2 reducers means ~34.5M edges each. Most of the cost
+is per-key overhead — a String, a map entry, and a `Set` that is itself a hash
+map costing ~200 bytes even with one element. Source URLs are interned: a page
+with 43 links contributes its URL to 43 sets, and before interning 2.6M edges did
+not fit in 512 MB.
+
+## Reproducing
 
 ```bash
 gh workflow run benchmark.yml     -f dataset=web-BerkStan
@@ -295,8 +290,9 @@ gh workflow run multi-machine.yml -f workers=4 -f slots=4 -f shuffle_batch=8192
 ```
 
 CI checks correctness on every push: 3-node and 1-node runs must agree, a killed
-node must not change the result, speculation must not change the result, and a
-hand-built WARC must normalize to an exact expected index.
+node must not change the result, speculation must not change the result, a
+replica must not be dropped under a running task, and a hand-built WARC must
+normalize to an exact expected index.
 
 ---
 
@@ -341,69 +337,10 @@ parse page, emit edges -> batched shuffle to reducers
 
 ForkJoin for the uneven directory tree, a fixed pool for uniform CPU-bound
 parsing, virtual threads for the many idle connections.
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the detail.
 
-```
-src/main/java/linkmesh/
-  Main.java     CLI
-  proto/        framed protocol, pooled connections, archive format
-  cluster/      membership, placement map, planner
-  storage/      local replica store
-  controller/   scheduling, speculation, job state
-  worker/       map pipeline, bounded queue, shuffle, reducer, gossip
-  ingest/       Wikipedia, WARC and edge-list readers, URL normalization
-```
-
-45 files, about 6,100 lines.
-
-### The replica deleted out from under a running task
-
-A 4-machine failure run turned up map tasks dying on
-`NoSuchFileException: .../pages-000001.page`. The job still finished, because a
-failed task is just rescheduled, but the cause was worth chasing.
-
-A map task reads a partition **by path, not by open handle**. The scan enumerates
-`Path` objects into a bounded queue and the parser opens them much later, so
-there is a window as wide as the queue is deep in which the files it is about to
-open can be unlinked.
-
-Two things widen that window into a real bug. An on-demand task fetch stores a
-replica the planner never asked for, and the controller only learns of it on the
-next inventory sweep. Placement then reads RF+1 holders and schedules a DROP of
-the surplus, picking the *most loaded* holder -- often the node that just fetched
-it and is reading it right now.
-
-Reproduce it, no failure injection needed beyond a node rejoining with its old
-replicas still on disk:
-
-```bash
-./scripts/reader-drop-demo.sh
-```
-
-```
-INFO  [control] dropped surplus replica of part-010 from node-1
-WARN  [map] map failure: NoSuchFileException: .../part-010/bucket-5/sub-1/pages-000019.page
-```
-
-The fix is a reader count in the store, not a bigger lock. `runTask` pins the
-partition for the length of the scan; `drop` refuses while the count is above
-zero and the controller re-plans on the next tick; the rebalancer skips any
-partition with an in-flight attempt. Both layers hold on their own -- with the
-controller-side skip disabled, the node still refuses:
-
-```
-INFO [store] not dropping part-007, 1 task(s) still reading it
-INFO [sched] part-007 complete on node-1 in 2041 ms
-INFO [control] dropped surplus replica of part-007 from node-1
-```
-
-Refused while read, dropped 200 ms after the task finished. Three runs hit the
-race before the fix, three were clean after, and it is now a CI step.
-
-`publish` had the same hazard in milder form: it renamed the live directory aside
-and deleted it immediately, with a comment claiming open handles kept readers
-safe. True for a descriptor already open, not for a path not yet opened. The
-retired copy now stays in `tmp/` until the next start.
+45 files, about 6,100 lines across `proto/` (framed protocol, pooled
+connections, archive format), `cluster/`, `storage/`, `controller/`, `worker/`
+and `ingest/`. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the detail.
 
 ## Limits
 
