@@ -338,38 +338,62 @@ you have one machine, run one node and raise `--slots`. Showing that adding
 *machines* speeds things up needs machines with their own cores, which a single
 host cannot demonstrate however it is configured.
 
-### Why scaling gets worse as the graph gets bigger
+### Does parallel speedup get worse on bigger graphs? No
 
-The same slot sweep on two graphs of very different size, both on the CI runner:
+It looked that way at first. web-BerkStan (7.6M edges) reached 3.24x on 4 slots
+while soc-LiveJournal1 (69M edges) managed only 1.38x, and the obvious story was
+that the reduce stage is a serial fraction that grows with the data.
 
-| slots | web-BerkStan (7.6M edges) | soc-LiveJournal1 (69M edges) |
-|---|---|---|
-| 1 | 16,503 ms (1.00x) | 115,028 ms (1.00x) |
-| 2 | 8,482 ms (1.95x) | 93,821 ms (1.23x) |
-| 4 | 5,095 ms (**3.24x**) | 83,477 ms (**1.38x**) |
+That story is wrong, and the arithmetic gives it away. If map and reduce both
+scale linearly with edge count their ratio is constant, so speedup should not
+move. Worse, the *serial* run of the big graph was **faster** per edge (1.67 µs
+vs 2.17 µs), which is the opposite of a growing serial fraction and exactly what
+you would expect from amortizing fixed overhead.
 
-Nine times the data, and the benefit of extra slots falls from 3.24x to 1.38x.
+The comparison was also not an experiment. It changed dataset, partition count
+(32 vs 128), heap (5g vs 11g) and trial count all at once.
 
-**Why.** A job has two parts: the map stage, which slots parallelize, and the
-reduce stage, which they do not. In this test there is one node, so there is one
-reducer, and **all 69 million edges funnel into it**.
+So here is the controlled version: **one** dataset, fed progressively more of
+itself, with heap fixed at 10g, one node, one reducer, same machine. Corpora are
+sharded by hash, so taking N partitions is a uniform sample of the graph.
 
-That reducer has to decode every edge, hash it, and insert it into a
-`Map<String, Set<String>>` that grows to 4.3 million keys. That work is serial and
-its size depends only on the dataset, not on how many map slots feed it.
+| edges | vs smallest | slots=1 | slots=2 | slots=4 | speedup at 4 | GC at 4 slots |
+|---|---|---|---|---|---|---|
+| 7.4M | 1.0x | 9,362 ms | 8,778 ms | 7,283 ms | 1.29x | 25.4% |
+| 17.2M | 2.3x | 24,253 ms | 19,332 ms | 16,378 ms | 1.48x | 28.5% |
+| 34.5M | 4.7x | 50,424 ms | 40,142 ms | 35,611 ms | 1.42x | 29.4% |
+| 69.0M | 9.3x | 106,082 ms | 86,323 ms | 79,627 ms | 1.33x | 31.1% |
 
-At 7.6M edges the reducer keeps up with the mappers, so making mappers faster
-makes the job faster. At 69M edges the reducer is the constraint, so faster
-mappers just queue behind it. More map threads even hurt slightly, by allocating
-faster and adding GC pressure.
+**Speedup is flat.** Across a 9.3x increase in data it goes 1.29, 1.48, 1.42,
+1.33 with no trend, and the smallest graph is the *worst* of the four. Scaling
+does not degrade with size.
 
-This is Amdahl's law with a specific culprit: the reduce stage is the serial
-fraction, and it grows with the data.
+Two things are true and worth separating:
 
-**The fix follows from the diagnosis:** add reducers, not slots. With
-`--reducers 4` each reducer would hold a quarter of the index and the serial
-fraction would shrink. I have not measured that, so treat it as the expected
-consequence rather than a result.
+**Per-edge cost grows slowly with size.** At one slot it rises from 1.268 to
+1.538 µs/edge, 21% over 9.3x more data. That is the memory hierarchy: the
+reducer's hash table outgrows cache, so inserts become random DRAM accesses. It
+is real, but it is sub-logarithmic and it hits the serial and parallel runs
+alike, which is exactly why speedup stays put.
+
+**The 3.24x vs 1.38x gap was a dataset difference, not a size difference.** At
+comparable size, 7.4M edges of LiveJournal gives 1.29x where 7.6M edges of
+BerkStan gives 3.24x. Same scale, 2.5x apart. LiveJournal is a social graph with
+4.8M nodes; BerkStan is a web graph with 685k. For a similar edge count that is
+far more distinct keys, so a much larger hash table, and GC sits at 25-31% of
+wall time on these runs.
+
+That key-count explanation is a hypothesis, not a measurement. What is measured
+is that graph *shape* matters much more than graph *size*, and that raising the
+heap does not help: at fixed data size, 600m / 1200m / 2400m gave 1.59x / 1.44x /
+1.49x, flat within noise. Whatever the limit is, it is not collector pressure
+that more headroom relieves.
+
+Reproduce with `./scripts/scaling-vs-size.sh` or:
+
+```bash
+gh workflow run scaling.yml -f dataset=soc-LiveJournal1 -f heap=10g
+```
 
 ### Why one reducer always finishes last
 
