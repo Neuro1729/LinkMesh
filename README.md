@@ -268,6 +268,42 @@ max fan-in     19,242
 
 About 16,000 pages/sec through the map stage. Output is 358 MB of TSV.
 
+### Public graph datasets, on the CI runner
+
+Both SNAP graphs, one node, `--reducers 1`, varying `--slots`. Run it yourself
+from the Actions tab, or:
+
+```bash
+gh workflow run benchmark.yml -f dataset=web-BerkStan -f partitions=32
+```
+
+**web-BerkStan** — 685,230 nodes, 7,600,595 edges, 617,094 keys, max fan-in
+84,208. Heap 5g, 32 partitions, median of 3:
+
+| slots | map stage | speedup |
+|---|---|---|
+| 1 | 16,503 ms | 1.00x |
+| 2 | 8,482 ms | 1.95x |
+| 4 | 5,095 ms | 3.24x |
+
+**soc-LiveJournal1** — 4,847,571 nodes, 68,993,773 edges, 4.3M sources. Heap
+11g, 128 partitions, median of 2:
+
+| slots | map stage | speedup |
+|---|---|---|
+| 1 | 115,028 ms | 1.00x |
+| 2 | 93,821 ms | 1.23x |
+| 4 | 83,477 ms | 1.38x |
+
+69M edges indexed in 109 s end to end, roughly 830,000 edges/sec through the map
+stage.
+
+The two datasets reach very different speedups, 3.24x against 1.38x. The obvious
+reading is that the bigger graph scales worse. That reading is wrong, and
+[the controlled experiment](#does-parallel-speedup-get-worse-on-bigger-graphs-no)
+below shows why: these two runs also differ in partition count, heap and trial
+count, and at equal size the gap is still there.
+
 ### Why slots matter and threads do not
 
 Same corpus, one node, changing only `--slots` (laptop, 61,322 articles):
