@@ -1,5 +1,7 @@
 # LinkMesh
 
+[![CI](https://github.com/Neuro1729/LinkMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/Neuro1729/LinkMesh/actions/workflows/ci.yml)
+
 A distributed MapReduce engine in Java 21 that builds backlink indexes: for every
 URL, the set of pages linking to it.
 
@@ -161,6 +163,11 @@ which is not something a single laptop can show.
 
 Every configuration above produced byte-identical output (same SHA-256 over
 193,326 keys).
+
+CI re-checks the correctness claims on every push, on a clean 2-core GitHub
+runner: a 3-node run and a 1-node run must produce the same index, a node killed
+mid-job must not change the result, speculation must not change the result, and
+a hand-built WARC must normalize to an exact expected index.
 
 Reproduce:
 
