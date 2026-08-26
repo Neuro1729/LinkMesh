@@ -265,8 +265,10 @@ replication_recovery_ms=2060
 
 One task redone, 8 partition copies issued, and full replication restored 2.1 s
 after the loss. Killing a node on a real 4-machine cluster instead: 3 tasks
-rescheduled and full replication restored in **3.0 s** across the network. RF=2 means the data survives, and re-running the task re-sends
-the same edges, which a `Set` absorbs.
+rescheduled and full replication restored in **3.0 s** across the network.
+
+RF=2 means the data survives, and re-running the task re-sends the same edges,
+which a `Set` absorbs.
 
 `failure_last_contact_ms` is staleness of the last heartbeat when the node was
 declared dead, not detection latency: on the connection-close path the
