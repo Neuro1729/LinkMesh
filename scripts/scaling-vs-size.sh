@@ -68,9 +68,13 @@ for N in $FRACTIONS; do
       if [ -z "$BEST" ] || [ "$MS" -lt "$BEST" ]; then BEST="$MS"; fi
     done
 
-    # Total pause time the collector reported during this run.
-    GC_MS=$(grep -oE 'Pause [A-Za-z ]*[0-9]+\.[0-9]+ms' "logs/gc-$N-$S.log" 2>/dev/null \
-            | grep -oE '[0-9]+\.[0-9]+' | awk '{s+=$1} END {printf "%.0f", s+0}')
+    # Total pause time the collector reported. The duration is the last field of
+    # each Pause line: "... Pause Young (Normal) (...) 51M->6M(92M) 5.035ms".
+    GC_LOG="logs/gc-$N-$S.log"
+    GC_MS=0
+    if [ -f "$GC_LOG" ]; then
+      GC_MS=$(awk '/Pause/ {d=$NF; sub(/ms$/, "", d); s+=d} END {printf "%.0f", s+0}' "$GC_LOG")
+    fi
     [ -z "$GC_MS" ] && GC_MS=0
     ./scripts/cluster-down.sh >/dev/null 2>&1 || true
 
